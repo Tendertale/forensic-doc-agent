@@ -1,0 +1,10 @@
+# 可选增强依赖 —— 安装需要联网下载，当前环境未安装。
+# 代码中已通过「预留接口 + 可用性探测」接入，缺少这些包时系统降级运行并在校核清单
+# 中显式报告，不会静默失败。详见 docs/TODO_DOWNLOADS.md。
+#
+#   pip install -r requirements-optional.txt
+#
+docxtpl>=0.19          # TODO-DL-1  Word 模板填充（Jinja2 语义，官方推荐方案）
+pypdfium2>=4.30        # TODO-DL-4  PDF 页面渲染为图像
+paddleocr>=3.0         # TODO-DL-2  中文印刷/手写 OCR（PP-OCRv5）
+paddlepaddle>=3.0      # TODO-DL-2  PaddleOCR 运行时

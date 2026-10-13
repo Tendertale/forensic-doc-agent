@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light" />
+  <title>法医尸表检验文书整理 Agent · 工作台</title>
+  <link rel="icon" href="data:," />
+  <!-- 无构建依赖：不引用任何 CDN / 字体 / 图标库，全部本地文件（TODO-DL-3） -->
+  <link rel="stylesheet" href="/static/workbench.css" />
+</head>
+<body>
+  <a class="skip-link" href="#view-root">跳到主内容</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" width="26" height="26" aria-hidden="true" focusable="false">
+        <path d="M6 2h9l5 5v15H6z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+        <path d="M15 2v5h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" />
+        <path d="M9 12h7M9 16h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+      </svg>
+      <div class="brand-text">
+        <strong>法医尸表检验文书整理 Agent</strong>
+        <span>无构建原生工作台（frontend/static）· 四步主流程：选择材料 → 核对疑点 → 查看文档 → 确认修改</span>
+      </div>
+    </div>
+    <div class="topbar-meta">
+      <span id="demo-badge" class="badge badge-info" hidden>演示数据</span>
+      <span id="conn-badge" class="badge badge-muted">未连接</span>
+      <span id="loading-slot" class="loading-slot" aria-live="polite"></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar" aria-label="主导航">
+      <button type="button" class="nav-item is-active" data-act="nav" data-view="cases">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        案件列表
+      </button>
+      <button type="button" class="nav-item" data-act="nav" data-view="case">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 3h9l5 5v13H5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+        案件工作台
+      </button>
+      <button type="button" class="nav-item" data-act="nav" data-view="rules">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="18" cy="16" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+        术语规则
+      </button>
+      <button type="button" class="nav-item" data-act="nav" data-view="config">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        系统配置
+      </button>
+      <div class="sidebar-note">
+        <p><strong>红线提示</strong></p>
+        <ul>
+          <li>空白字段一律显示“未记录”，不写成“未见异常”。</li>
+          <li>鉴定意见只能由专业人员手工输入。</li>
+          <li>部位照片：系统不读取照片内容，只按你选择的位置插入（位置只能从目录中选择）。</li>
+          <li>本次没有照片的照片栏位写“（未提供照片）”，不会拿其他栏位顶替。</li>
+        </ul>
+      </div>
+    </nav>
+
+    <main id="view-root" class="content" tabindex="-1">
+      <div id="banner-slot" class="banner-slot" role="alert" aria-live="assertive"></div>
+      <section id="view-cases" class="view" hidden></section>
+      <section id="view-case" class="view" hidden></section>
+      <section id="view-rules" class="view" hidden></section>
+      <section id="view-config" class="view" hidden></section>
+      <noscript>
+        <p class="callout callout-warn">
+          本工作台为原生 ES 模块实现，需要浏览器启用 JavaScript。后端 <code>/api/**</code> 在未启用 JavaScript 时仍可直接调用。
+        </p>
+      </noscript>
+    </main>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script type="module" src="/static/workbench.js"></script>
+</body>
+</html>

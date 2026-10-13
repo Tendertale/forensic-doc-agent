@@ -1,0 +1,13 @@
+# 运行时依赖（本机已安装，无需下载即可运行与测试）
+#
+# 校验命令： python -m pip install -r requirements.txt   （已满足时为空操作）
+# 可选增强依赖见 requirements-optional.txt，其安装属于待办事项，
+# 详见 docs/TODO_DOWNLOADS.md。
+fastapi>=0.115
+uvicorn>=0.33
+pydantic>=2.10
+pytest>=8.3
+httpx>=0.28
+python-docx>=1.1
+Pillow>=11.0
+Jinja2>=3.1

@@ -1,0 +1,35 @@
+# 运行时数据与产物
+data/
+storage/
+*.db
+*.sqlite3
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 参考项目（只读复用对象，不作为运行时依赖）
+_ref_hotspot/
+
+# 临时脚本、探针与运行日志（本地证据，不入库）
+_env_check.py
+_probe_*
+_probe_out/
