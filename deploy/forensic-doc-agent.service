@@ -1,7 +1,7 @@
 [Unit]
 # 法医尸表检验文书整理 Agent（FastAPI + 无构建工作台）
 # 由 deploy/install.sh 落地到 /etc/systemd/system/forensic-doc-agent.service
-Description=法医尸表检验文书整理 Agent (FastAPI, 127.0.0.1 only)
+Description=法医尸表检验文书整理 Agent (FastAPI)
 Documentation=file://@APP_DIR@/docs/DEPLOY.md
 After=network-online.target
 Wants=network-online.target

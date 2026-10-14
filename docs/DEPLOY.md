@@ -25,6 +25,20 @@
 `requirements.txt` 补 `PyMuPDF`（否则服务器上 PDF 材料无法渲染/读取文字层）；
 `deploy/install.sh` 修 git ownership 与工作目录问题。
 
+### 0.1 第二阶段：改为服务器常驻访问（子域名 + 鉴权）
+
+在同一台 VPS 上继续做了「不依赖本机隧道」的常驻访问配置，实测结果：
+
+| 验证项 | 结果 |
+| --- | --- |
+| 监听与鉴权 | `--bind 0.0.0.0 --basic-auth 'forensic:***'` 重部署成功；`/api/health` 200（免鉴权）、`/api/config` 无凭据 **401**、带凭据 **200** |
+| 新增站点 | `/opt/proxy/nginx/conf.d/forensic-doc-agent.conf` 已安装；`docker exec nginx nginx -t` 通过、`nginx -s reload` 平滑生效 |
+| 容器→宿主 | nginx 容器访问 `http://172.19.0.1:9765/api/config`：无凭据 401、带凭据 200 |
+| 完整链路 | `nginx`(443, SNI `forensic.sekaitree.xyz`)：`/api/health` 200、`/api/config` 401、`/` 带凭据 200、`/api/cases` 返回真实 JSON；80 端口 → 301 |
+| 既有站点 | `api.sekaitree.xyz` 仍 200（未改动其配置）；仅有 nginx 自身的 http2 弃用告警 |
+| 公网暴露面 | 直连 `47.251.245.125:9765` **仍然超时**（安全组未放行）——唯一公网入口是 443 上的站点，且需凭据 |
+| 待用户完成 | Cloudflare 添加 A 记录 `forensic` → 服务器公网 IP（可开代理）后，`https://forensic.sekaitree.xyz/` 即可直接访问 |
+
 ---
 
 本文件是「把服务放到服务器上并让浏览器访问」的完整说明。核心约束先写在最前面：
