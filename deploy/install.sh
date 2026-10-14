@@ -61,13 +61,17 @@ mkdir -p "$APP_DIR" "$DATA_DIR" "$DATA_DIR/storage" "$DATA_DIR/home"
 chown -R "$APP_USER:$APP_USER" "$APP_DIR" "$DATA_DIR"
 
 log "3/7 代码（clone / pull）"
+# 用 -c safe.directory 而不是改 git 全局配置：脚本以 root 运行，目录随后归属运行用户，
+# 不加这一项会报 fatal: detected dubious ownership。
 if [[ -d "$APP_DIR/.git" ]]; then
-  git -C "$APP_DIR" fetch --depth 1 origin >/dev/null 2>&1 || true
-  git -C "$APP_DIR" reset --hard origin/HEAD >/dev/null 2>&1 || git -C "$APP_DIR" pull --ff-only || true
-  echo "  已更新到 $(git -C "$APP_DIR" rev-parse --short HEAD)"
+  git -c safe.directory="$APP_DIR" -C "$APP_DIR" fetch --depth 1 origin >/dev/null 2>&1 || true
+  if ! git -c safe.directory="$APP_DIR" -C "$APP_DIR" reset --hard origin/HEAD >/dev/null 2>&1; then
+    git -c safe.directory="$APP_DIR" -C "$APP_DIR" pull --ff-only || true
+  fi
+  echo "  已更新到 $(git -c safe.directory="$APP_DIR" -C "$APP_DIR" rev-parse --short HEAD)"
 else
   git clone --depth 1 "$REPO_URL" "$APP_DIR"
-  echo "  已克隆 $(git -C "$APP_DIR" rev-parse --short HEAD)"
+  echo "  已克隆 $(git -c safe.directory="$APP_DIR" -C "$APP_DIR" rev-parse --short HEAD)"
 fi
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
@@ -89,11 +93,12 @@ systemctl enable forensic-doc-agent >/dev/null
 
 log "6/7 演示案件（首次）"
 if [[ "$WITH_SEED" -eq 1 ]]; then
+  # 必须在应用目录内执行（-m backend.scripts.* 依赖当前目录在 sys.path 上）。
   sudo -u "$APP_USER" env \
     FORENSIC_DB_PATH="$DATA_DIR/cases.db" \
     FORENSIC_STORAGE_ROOT="$DATA_DIR/storage" \
     HOME="$DATA_DIR/home" \
-    "$APP_DIR/.venv/bin/python" -m backend.scripts.demo_pipeline --force || true
+    bash -c "cd '$APP_DIR' && exec ./.venv/bin/python -m backend.scripts.demo_pipeline" || true
 else
   echo "  已跳过"
 fi
