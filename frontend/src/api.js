@@ -65,6 +65,9 @@ export const api = {
   deleteCase: (id, expectedVersion) =>
     request(`/cases/${id}${buildQuery({ expected_version: expectedVersion })}`, { method: 'DELETE' }),
 
+  // 普通用户主流程（R-59～R-63）：一次调用跑完建案 → 识别 → 提取 → 整理 → 生成 → 校核
+  quickRun: (payload) => request('/quick-run', { method: 'POST', body: JSON.stringify(payload) }),
+
   addMaterial: (id, payload) => request(`/cases/${id}/materials`, { method: 'POST', body: JSON.stringify(payload) }),
   listMaterials: (id) => request(`/cases/${id}/materials`),
   updateMaterialPage: (id, materialId, pageNumber, payload) =>

@@ -241,6 +241,60 @@ class OcrRunRequest(BaseModel):
     force: bool = False
 
 
+class QuickRunFile(BaseModel):
+    """「上传即出结果」向导里的单个文件。
+
+    ``kind`` / ``position_key`` 留空表示**由后端按文件名与扩展名推测**（只看文件名这一用户提供的文字，
+    绝不读取图片内容，N-11）；用户在前端点选时以用户选择为准。
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    filename: str = Field(min_length=1, max_length=200)
+    media_type: Literal["pdf", "jpeg", "png", "docx", "json", "other"] = "other"
+    content_base64: str = Field(default="", description="文件字节的 base64；留空则只登记不落盘")
+    kind: str = Field(default="", max_length=40, description="留空=自动判断；取值同 MATERIAL_KINDS")
+    position_key: str = Field(default="", max_length=40, description="仅部位照片有意义；留空=按文件名推测")
+    clarity_note: str = Field(default="", max_length=1000)
+
+    @field_validator("kind")
+    @classmethod
+    def validate_kind(cls, value: str) -> str:
+        if value and value not in MATERIAL_KINDS:
+            raise ValueError("未知材料类型：" + value + "；可选：" + "、".join(MATERIAL_KINDS))
+        return value
+
+    @field_validator("position_key")
+    @classmethod
+    def validate_position(cls, value: str) -> str:
+        if value and value not in PHOTO_POSITION_KEYS:
+            raise ValueError("未知照片目标位置：" + value)
+        return value
+
+
+class QuickRunRequest(BaseModel):
+    """一次调用完成「上传 → 识别 → 提取 → 整理 → 生成 → 校核」。
+
+    这是给普通用户的主流程：只关心「传了什么」和「要 Word 还是 PDF」。
+    该端点是**新建案件**（等价于 `POST /api/cases` + 后续所有阶段），因此不携带 `expected_version`
+    （与 `POST /api/cases` 一致；契约 §4 说明见 architecture.md）。
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    files: List[QuickRunFile] = Field(min_length=1, max_length=40)
+    formats: List[OutputFormat] = Field(default_factory=lambda: ["docx", "pdf"], min_length=1, max_length=2)
+    case_no: str = Field(default="", max_length=64, description="留空时自动生成")
+    commission_unit: str = Field(default="", max_length=120)
+    subject_name: str = Field(default="", max_length=80)
+    note: str = Field(default="", max_length=300)
+
+    @field_validator("formats")
+    @classmethod
+    def dedupe_formats(cls, value: List[str]) -> List[str]:
+        return list(dict.fromkeys(value))
+
+
 class ExtractRequest(BaseModel):
     expected_version: int = Field(ge=1)
     material_ids: List[int] = Field(default_factory=list, max_length=32)
@@ -494,6 +548,8 @@ __all__ = [
     "PhotoPlacementUpdate",
     "PreprocessRequest",
     "OcrRunRequest",
+    "QuickRunFile",
+    "QuickRunRequest",
     "ExtractRequest",
     "FieldUpdate",
     "InjuryCreate",

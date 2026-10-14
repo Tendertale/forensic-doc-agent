@@ -21,7 +21,7 @@
       </svg>
       <div class="brand-text">
         <strong>法医尸表检验文书整理 Agent</strong>
-        <span>无构建原生工作台（frontend/static）· 四步主流程：选择材料 → 核对疑点 → 查看文档 → 确认修改</span>
+        <span>主界面：上传 → 结果（一次点击拿到 Word / PDF）· 次级界面：案件记录（四步核对：选择材料 → 核对疑点 → 查看文档 → 确认修改）</span>
       </div>
     </div>
     <div class="topbar-meta">
@@ -33,13 +33,32 @@
 
   <div class="layout">
     <nav class="sidebar" aria-label="主导航">
-      <button type="button" class="nav-item is-active" data-act="nav" data-view="cases">
+      <div class="nav-group-title">主流程（Transparent）</div>
+      <button type="button" class="nav-item is-active" data-act="nav" data-view="quick">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 16V4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M7 9l5-5 5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v3h16v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        整理
+        <span class="nav-hint">上传文件</span>
+      </button>
+      <button type="button" class="nav-item" data-act="nav" data-view="results">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M6 2h9l5 5v15H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M15 2v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 13l2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        结果
+        <span id="results-nav-badge" class="badge badge-muted" hidden>尚未整理</span>
+      </button>
+
+      <div class="nav-group-title">案卷与复核（次级界面）</div>
+      <button type="button" class="nav-item" data-act="nav" data-view="cases">
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-        案件列表
+        案件记录
+        <span class="nav-hint">列表</span>
       </button>
       <button type="button" class="nav-item" data-act="nav" data-view="case">
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M5 3h9l5 5v13H5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
         案件工作台
+        <span class="nav-hint">四步核对</span>
+      </button>
+      <button type="button" class="nav-item" data-act="nav" data-view="review">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3l8 4v6c0 4-3.4 7.1-8 8-4.6-.9-8-4-8-8V7z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        复核中心
       </button>
       <button type="button" class="nav-item" data-act="nav" data-view="rules">
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="18" cy="16" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
@@ -54,7 +73,7 @@
         <ul>
           <li>空白字段一律显示“未记录”，不写成“未见异常”。</li>
           <li>鉴定意见只能由专业人员手工输入。</li>
-          <li>部位照片：系统不读取照片内容，只按你选择的位置插入（位置只能从目录中选择）。</li>
+          <li>部位照片：系统不读取照片内容，只按你选择的位置插入（未选择时按文件名推测，可在案件记录中修改）。</li>
           <li>本次没有照片的照片栏位写“（未提供照片）”，不会拿其他栏位顶替。</li>
         </ul>
       </div>
@@ -62,6 +81,9 @@
 
     <main id="view-root" class="content" tabindex="-1">
       <div id="banner-slot" class="banner-slot" role="alert" aria-live="assertive"></div>
+      <section id="view-quick" class="view" hidden></section>
+      <section id="view-results" class="view" hidden></section>
+      <section id="view-review" class="view" hidden></section>
       <section id="view-cases" class="view" hidden></section>
       <section id="view-case" class="view" hidden></section>
       <section id="view-rules" class="view" hidden></section>

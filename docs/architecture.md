@@ -192,6 +192,7 @@ storage/
 | POST | `/api/ai/verify` | 头 `X-DeepSeek-API-Key` | 测试模型连通性（`llm.py`） |
 | GET | `/api/cases` | 查询参数 | 服务端分页/搜索/筛选 |
 | POST | `/api/cases` | `CaseCreate` | 建案，自动生成 `case_no`，返回完整案件 |
+| POST | `/api/quick-run` | `QuickRunRequest` | **普通用户主流程（R-59～R-63）**：一次调用跑完「建案 → 登记材料 → 预处理 → 识别 → 提取 → 整理 → 生成 → 校核」。属**新建案件**（等价于 `POST /api/cases`），因此**不携带 `expected_version`**。材料类型/照片位置留空时由后端按**文件名与扩展名**推断（绝不读取图片内容，N-11）。响应用途固定：`{case_id, case_no, stage, steps[], assignments[], summary{}, documents[], notes[], case_url}`（`documents[].download_urls.{docx,pdf}` 直接可用）。单步失败写进 `steps[].ok=false` 并继续，PDF 失败记入 `notes` |
 | GET | `/api/cases/{case_id}` | — | 详情：案件 + `materials` + `fields` + `injuries` + `documents` + `checklist` + `events` + `corrections` |
 | PATCH | `/api/cases/{case_id}` | `CaseUpdate` | 修改案件基础信息；**`opinion_text`（鉴定意见）只能由用户请求原样写入**，任何代码路径不得从 OCR 推导（N-1/INV-10） |
 | PATCH | `/api/cases/{case_id}/stage` | `CaseStageUpdate` | 推进/回退阶段 |
@@ -799,6 +800,8 @@ export const api = {
   updateCase: (id, payload) => ...,          // payload 含 expected_version
   updateStage: (id, payload) => ...,
   deleteCase: (id, expectedVersion) => ...,
+  caseSummary: ...,
+  quickRun: (payload) => ...,                              // POST /api/quick-run（普通用户主流程）
   addMaterial: (id, payload) => ...,
   listMaterials: (id) => ...,
   updateMaterialPage: (id, materialId, pageNumber, payload) => ...,
@@ -880,6 +883,8 @@ App.vue
 
 | 区块 | 必须提供 |
 | --- | --- |
+| **主视图「整理」（默认视图，R-59/R-62）** | 拖拽/多选上传（照片、Word、PDF、JSON）、每份文件的类型芯片（默认「自动判断」，可改；选「部位照片」时出现目标位置下拉，取自 `photo_positions`）、输出格式选择（Word/PDF/两者）、一键「开始整理」（`POST /api/quick-run`）、结果面板（成品下载、字段/损伤/疑点/阻断摘要、自动归类说明、进入案件记录） |
+| **次级「案件记录」** | 原四步工作台的全部能力（材料、字段来源核对、损伤、部位照片、文稿、校核清单、修正、阶段推进） |
 | 案件列表 | 分页/搜索/筛选、建案（含 intake 表）、删除 |
 | 材料 | 选择文件上传（`FileReader` → base64）、质量标记、预处理、运行 OCR、原图预览、识别结果分页 |
 | 部位照片 | 上传、缩略图、目标位置下拉（`/api/config` 的 `photo_positions`）、`PATCH .../placement`、顺序调整 |

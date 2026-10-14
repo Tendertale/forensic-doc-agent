@@ -104,6 +104,7 @@ from .schemas import (
     OcrRunRequest,
     PhotoPlacementUpdate,
     PreprocessRequest,
+    QuickRunRequest,
     TerminologyRuleCreate,
     TerminologyRuleUpdate,
 )
@@ -919,3 +920,37 @@ def deliver(case_id: int, request: Request, payload: DeliverRequest = Body(...)
                    formats=data.get("formats") or ("docx", "pdf"),
                    expected_version=int(data["expected_version"]), actor="复核人")
     return result.as_dict()
+
+
+# --------------------------------------------------------------------------
+# 快速通道：上传即出结果（R-59～R-63）
+# --------------------------------------------------------------------------
+
+
+@router.post("/quick-run")
+def quick_run(request: Request, payload: QuickRunRequest = Body(...)) -> Dict[str, Any]:
+    """普通用户主流程：一次调用跑完「建案 → 登记材料 → 预处理 → 识别 → 提取 → 整理 → 生成 → 校核」。
+
+    契约要点（`docs/architecture.md` 第 4 节 / `backend/app/schemas.py`）：
+
+    * **本端点是新建案件**（等价于 `POST /api/cases` + 后续全部阶段），因此请求体
+      **不携带 `expected_version`**：案件在这一步才刚刚建立，不存在可供校验的既有版本。
+      端点内部所有写入统一传 `expected_version=0`（系统内部写：不重复校验，但同样占用
+      并递增 `cases.version`，与 `workflow.py` 内部写口径一致：INV-9 + D1）。
+    * 材料类型与部位照片目标位置留空时，**只按文件名与扩展名**推断（R-60）；
+      绝不读取图片字节、不做内容识别或分类（N-11）。
+    * `files` 为空 → 422（`QuickRunRequest.files` 的 `min_length=1`，Pydantic 校验）；
+      `content_base64` 全部为空 → 400（`ValueError`，中文 `detail`）；
+      其余异常按 :func:`_handle_error` 既有映射处理。
+    * 单步失败不丢结果：失败写进 `steps[].ok=false` + `detail` 并继续后续步骤；
+      PDF 导出失败只记入 `notes`，不返回 500（R-63）。
+
+    响应键固定为：`{case_id, case_no, stage, steps[], assignments[], summary{},
+    documents[], notes[], case_url}`；`documents[].download_urls.{docx,pdf}` 可直接下载。
+    """
+
+    # 局部导入：本端点按纪律**只追加**，不改动既有导入顺序。
+    from .quick import run_quick_pipeline
+
+    data = payload.model_dump()
+    return _call(run_quick_pipeline, _db(request), _storage(request), data)

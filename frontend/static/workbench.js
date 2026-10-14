@@ -4,7 +4,10 @@
  *
  * 设计要点（docs/architecture.md 第 7.3 节）：
  * - 纯原生 ES 模块 + fetch，无打包器、无 CDN、无外链字体或图标；图标为内联 SVG 或 Unicode。
- * - 覆盖四步主流程（R-1）：选择材料 → 核对疑点 → 查看文档 → 确认修改。
+ * - 主视图（默认首屏）「整理」：拖拽/选择文件 → 选输出格式 → 一次 POST /api/quick-run
+ *   → 自动切到「结果」下载 Word/PDF；普通用户不需要看到四步流程的细节。
+ * - 次级界面「案件记录」保留全部既有功能，覆盖四步主流程（R-1）：
+ *   选择材料 → 核对疑点 → 查看文档 → 确认修改。
  * - 界面文案全中文；空白字段一律显示“未记录”，绝不显示“未见异常”（N-5）。
  * - `unclear` 字段带醒目“待辨认/冲突”标记，并同时展示冲突双方的来源与取值（R-44）。
  * - 鉴定意见（opinion）标注“由专业人员提供”，只允许手工输入（N-1）。
@@ -65,7 +68,8 @@ const ENDPOINT_MANIFEST = [
   ['PATCH', '/api/checklist/{item_id}'],                                      // 处理/豁免校核项
   ['POST', '/api/cases/{case_id}/corrections'],                               // 四类修正录入
   ['GET', '/api/cases/{case_id}/corrections'],                                // 修正记录
-  ['POST', '/api/cases/{case_id}/deliver'],                                   // 保存交付
+  ['POST', '/api/cases/{case_id}/deliver'],                                  // 保存交付
+  ['POST', '/api/quick-run'],                                                 // 主视图：一次请求完成识别/归类/生成
 ]
 
 /* ==========================================================================
@@ -163,6 +167,39 @@ const OCR_ENGINE_FALLBACK = [
 const DRAFT_MARKER = '【待核对】'
 const PHOTO_PLACEHOLDER_TEXT = '（未提供照片）'
 
+/* --------------------------------------------------------------------------
+ * 1.1 主视图「整理」契约（POST /api/quick-run）
+ *     普通用户只需两件事：上传文件、下载结果；其余细节收在「案件记录」次级界面。
+ * ------------------------------------------------------------------------ */
+
+/** 主视图唯一入口端点（冻结契约，见 docs/architecture.md 第 4 节）。 */
+const QUICK_RUN_ENDPOINT = '/api/quick-run'
+/** 单文件提示阈值：超过它只提示不改行为（网关 nginx 侧上限 64 MB）。 */
+const QUICK_MAX_FILE_BYTES = 30 * 1024 * 1024
+/** 网关上单体请求上限（base64 后约为原文件的 4/3）。 */
+const QUICK_GATEWAY_LIMIT_BYTES = 64 * 1024 * 1024
+
+/**
+ * 每个文件的类型芯片：`kind` 留空 = 交后端按文件名推断（契约要求 kind 可空）。
+ * 第二个元素是本工作台的中文标注，实际显示时若后端 /api/config 给了更规范的标签
+ * （如 approved_report → 已审核报告），会把两者并列显示，避免口径不一致。
+ */
+const QUICK_KIND_CHIPS = [
+  ['', '自动判断'],
+  ['commission', '委托书'],
+  ['record_book', '记录本'],
+  ['photo', '部位照片'],
+  ['template', '模板'],
+  ['approved_report', '补审报告'],
+  ['supplement', '补充资料'],
+]
+
+/** 文件选择框 accept：照片、PDF、Word、JSON（契约 media_type 覆盖范围）。 */
+const QUICK_ACCEPT = 'image/*,.pdf,.docx,.doc,.json'
+
+/** N-11/R-58 必须显著标注的照片口径（原文固定，不得改写）。 */
+const QUICK_PHOTO_POLICY = '系统不读取照片内容，只按你选择的位置插入（未选择时按文件名推测，可在案件记录中修改）'
+
 const STEP_TITLES = [
   { n: 1, title: '选择材料', hint: '上传/登记材料，检查页质量，运行识别；为部位照片选择目标位置' },
   { n: 2, title: '核对疑点', hint: '字段来源与确认、损伤逐条、术语整理、校核清单' },
@@ -175,7 +212,7 @@ const STEP_TITLES = [
  * ========================================================================== */
 
 const state = {
-  view: 'cases',
+  view: 'quick',
   step: 1,
   booted: false,
   health: null,
@@ -217,6 +254,27 @@ const state = {
   aiResult: null,
   banners: [],
   loading: 0,
+
+  // —— 主视图「整理」（POST /api/quick-run）——
+  // files 保存浏览器 File 对象本身：重新渲染视图不会丢文件，失败时也不清空。
+  quick: {
+    files: [],             // [{id, file, name, size, media_type, kind, position_key}]
+    formats: ['docx', 'pdf'],
+    case_no: '',
+    commission_unit: '',
+    subject_name: '',
+    note: '',
+    showOptional: false,
+    running: false,
+    phase: '',
+    startedAt: 0,
+    error: '',
+    result: null,          // /api/quick-run 响应的归一化结果
+  },
+  quickSeq: 0,
+
+  // —— 次级界面「复核中心」（只用既有端点，不发明新接口）——
+  review: { blocking: null, top: null, loaded: false, error: '' },
 }
 
 /* ==========================================================================
@@ -802,7 +860,10 @@ async function loadRules() {
 
 function setView(view) {
   state.view = view
-  const map = { cases: '#view-cases', case: '#view-case', rules: '#view-rules', config: '#view-config' }
+  const map = {
+    quick: '#view-quick', results: '#view-results', review: '#view-review',
+    cases: '#view-cases', case: '#view-case', rules: '#view-rules', config: '#view-config',
+  }
   Object.entries(map).forEach(([key, selector]) => {
     const node = $(selector)
     if (node) node.hidden = key !== view
@@ -814,12 +875,34 @@ function setView(view) {
 }
 
 function render() {
-  if (state.view === 'cases') renderCasesView()
+  if (state.view === 'quick') renderQuickView()
+  else if (state.view === 'results') renderResultsView()
+  else if (state.view === 'review') renderReviewView()
+  else if (state.view === 'cases') renderCasesView()
   else if (state.view === 'case') renderCaseView()
   else if (state.view === 'rules') renderRulesView()
   else if (state.view === 'config') renderConfigView()
+  renderResultsNavBadge()
   renderBanners()
   renderConnection()
+}
+
+/** 导航「结果」上的小徽标：让用户一眼看到是否已有产物、还有多少疑点。 */
+function renderResultsNavBadge() {
+  const node = $('#results-nav-badge')
+  if (!node) return
+  const result = state.quick.result
+  if (!result) {
+    node.hidden = false
+    node.className = 'badge badge-muted'
+    node.textContent = '尚未整理'
+    return
+  }
+  const unresolved = num(result.summary && result.summary.unresolved_count, 0)
+  const blocking = num(result.summary && result.summary.blocking_count, 0)
+  node.hidden = false
+  node.className = 'badge ' + (blocking ? 'badge-danger' : (unresolved ? 'badge-warn' : 'badge-ok'))
+  node.textContent = blocking ? ('阻断 ' + blocking) : (unresolved ? ('待处理 ' + unresolved) : '已完成')
 }
 
 /* ==========================================================================
@@ -1236,7 +1319,7 @@ function materialsPanel() {
   }).join('')
 
   return previewBox() +
-    '<div class="card"><div class="card-head"><div class="card-title">材料清单' +
+    '<div class="card" id="panel-materials"><div class="card-head"><div class="card-title">材料清单' +
     '<span class="badge badge-muted">GET/POST /api/cases/{id}/materials</span></div>' +
     '<span class="small muted">必收材料：' + cfg.required_material_kinds.map((kind) =>
       esc(labelOf(cfg.material_kind_labels, kind))).join('、') + '</span></div>' +
@@ -1377,7 +1460,7 @@ function photoPanel() {
       '</div>'
     : ''
 
-  return '<div class="card"><div class="card-head"><div class="card-title">部位照片（N-11）' +
+  return '<div class="card" id="panel-photo"><div class="card-head"><div class="card-title">部位照片（N-11）' +
     '<span class="badge badge-danger">系统不读取照片内容，只按你选择的位置插入</span></div>' +
     '<span class="badge badge-muted">PATCH .../placement · GET .../photo-slots</span></div>' +
     '<div class="card-body">' +
@@ -2133,6 +2216,806 @@ function renderConfigView() {
 }
 
 /* ==========================================================================
+ * 18b. 主视图「整理」：上传 → 一次请求 → 结果（POST /api/quick-run）
+ *      普通用户只需要两件事：上传文件、下载结果。识别、归类、生成、校核的
+ *      全部细节都留在次级界面「案件记录」的四步核对里，本页不暴露。
+ *      注意：本页不读取照片内容、不做任何图像推断（N-11/R-55/R-58）。
+ * ========================================================================== */
+
+function quickSizeText(bytes) {
+  const value = num(bytes, 0)
+  if (value < 1024) return value + ' B'
+  if (value < 1024 * 1024) return (value / 1024).toFixed(1) + ' KB'
+  return (value / (1024 * 1024)).toFixed(2) + ' MB'
+}
+
+function quickSelectedBytes() {
+  return state.quick.files.reduce((sum, item) => sum + num(item.size, 0), 0)
+}
+
+/** base64 编码后体积约为原始字节的 4/3，用来预估是否触及网关上限。 */
+function quickEstimateBytes() {
+  return Math.round(quickSelectedBytes() * 4 / 3)
+}
+
+function quickFormatsFromChoice(choice) {
+  if (choice === 'docx') return ['docx']
+  if (choice === 'pdf') return ['pdf']
+  return ['docx', 'pdf']
+}
+
+function quickFormatChoice(formats) {
+  const list = (Array.isArray(formats) ? formats : []).slice().sort().join(',')
+  if (list === 'docx') return 'docx'
+  if (list === 'pdf') return 'pdf'
+  return 'both'
+}
+
+function quickFormatSummary(formats) {
+  const choice = quickFormatChoice(formats)
+  if (choice === 'docx') return '只要 Word（.docx）'
+  if (choice === 'pdf') return '只要 PDF'
+  return 'Word 与 PDF 都要'
+}
+
+/**
+ * 组装 `POST /api/quick-run` 请求体（纯函数，供静态自检与人工核对）。
+ * 契约：{files:[{filename,media_type,content_base64,kind,position_key}], formats:[...],
+ *        case_no, commission_unit, subject_name, note}
+ * `kind` 留空 = 交后端按文件名推断；`position_key` 只对部位照片发送
+ * （后端对非照片指定位置会返回 400「只有部位照片才能指定目标位置」）。
+ */
+function buildQuickRunPayload(files, options) {
+  const opts = options || {}
+  const formats = Array.isArray(opts.formats) && opts.formats.length
+    ? opts.formats.slice()
+    : ['docx', 'pdf']
+  return {
+    files: (Array.isArray(files) ? files : []).map((item) => {
+      const kind = (item && item.kind) || ''
+      return {
+        filename: (item && item.filename) || '',
+        media_type: (item && item.media_type) || 'other',
+        content_base64: (item && item.content_base64) || '',
+        kind: kind,
+        position_key: kind === 'photo' ? ((item && item.position_key) || '') : '',
+      }
+    }),
+    formats: formats,
+    case_no: ((opts.case_no || '') + '').trim(),
+    commission_unit: ((opts.commission_unit || '') + '').trim(),
+    subject_name: ((opts.subject_name || '') + '').trim(),
+    note: ((opts.note || '') + '').trim(),
+  }
+}
+
+/**
+ * 下载地址白名单：只接受同源相对路径或与当前页面同源的绝对地址。
+ * 本工作台不引用任何外部资源（无 CDN / 字体 / 图标库），也不允许把用户
+ * 导向站外地址；不满足时返回空串，由调用方把按钮置灰并说明原因。
+ */
+function quickUrlAllowed(url) {
+  const text = String(url || '').trim()
+  if (!text) return false
+  if (text.indexOf('://') < 0) return true
+  if (text.charAt(0) === '/') return true
+  if (typeof window === 'undefined' || !window.location) return false
+  return text.indexOf(window.location.origin + '/') === 0
+}
+
+/** 文稿下载地址：优先用响应里的 `download_urls`，缺失或被判为站外地址时回退 `downloadUrl()`（同一端点）。 */
+function quickDownloadUrl(doc, fmt) {
+  const document_ = doc || {}
+  const urls = document_.download_urls && typeof document_.download_urls === 'object'
+    ? document_.download_urls : {}
+  const direct = fmt === 'pdf' ? urls.pdf : urls.docx
+  // 站外地址一律不用（本工作台没有任何外链），改走同源的下载端点。
+  if (direct && quickUrlAllowed(direct)) return String(direct)
+  if (document_.id !== undefined && document_.id !== null && document_.id !== '') {
+    return api.downloadUrl(document_.id, fmt)
+  }
+  return ''
+}
+
+/** 该文稿在本次响应里是否真的产出了指定格式（缺失时按钮必须置灰）。 */
+function quickHasFormat(doc, fmt) {
+  const document_ = doc || {}
+  if (fmt === 'pdf') {
+    if (document_.has_pdf !== undefined && document_.has_pdf !== null) return Boolean(document_.has_pdf)
+    return Boolean((document_.download_urls && document_.download_urls.pdf) ||
+      document_.filename_pdf || document_.pdf_path)
+  }
+  if (document_.has_docx !== undefined && document_.has_docx !== null) return Boolean(document_.has_docx)
+  return Boolean((document_.download_urls && document_.download_urls.docx) ||
+    document_.filename_docx || document_.docx_path)
+}
+
+/** 类型芯片文案：本工作台标注 + 后端规范标签并列，避免口径不一致。 */
+function quickKindLabel(kind, fallback) {
+  const backend = (state.cfg.material_kind_labels && state.cfg.material_kind_labels[kind]) || ''
+  if (!fallback) return backend || kind
+  if (backend && backend !== fallback) return fallback + '（' + backend + '）'
+  return fallback
+}
+
+function quickKindChips(item) {
+  return QUICK_KIND_CHIPS.map((pair) => {
+    const kind = pair[0]
+    const label = pair[1]
+    const active = item.kind === kind
+    return '<button type="button" class="chip' + (active ? ' is-active' : '') + '" data-act="quick-kind"' +
+      ' data-id="' + num(item.id, 0) + '" data-kind="' + esc(kind) + '" aria-pressed="' + (active ? 'true' : 'false') + '"' +
+      ' title="' + esc(kind ? ('材料类型 kind=' + kind) : 'kind 留空：交后端按文件名推断') + '">' +
+      esc(quickKindLabel(kind, label)) + '</button>'
+  }).join('')
+}
+
+function quickPositionSelect(item) {
+  if (item.kind !== 'photo') return ''
+  return '<label class="inline-field small">目标位置' +
+    '<select class="select select-sm" data-quick-position="' + num(item.id, 0) + '">' +
+    photoPositionOptions(item.position_key, '自动（按文件名推测）') + '</select></label>'
+}
+
+function quickFileRow(item) {
+  const oversize = num(item.size, 0) > QUICK_MAX_FILE_BYTES
+  return '<div class="quick-file">' +
+    '<div class="quick-file-head">' +
+    '<span class="quick-file-name">' + esc(item.name) + '</span>' +
+    badge('muted', quickSizeText(item.size)) +
+    badge('muted', 'media=' + esc(item.media_type)) +
+    (oversize ? badge('warn', '超过 30 MB') : '') +
+    (item.kind === 'photo' ? badge('info', '部位照片：不参与识别') : '') +
+    '<button type="button" class="btn btn-sm" data-act="quick-remove" data-id="' + num(item.id, 0) + '">移除</button>' +
+    '</div>' +
+    '<div class="quick-file-kind"><span class="small muted">类型</span>' +
+    '<div class="chips">' + quickKindChips(item) + '</div>' + quickPositionSelect(item) + '</div>' +
+    (item.kind === 'photo'
+      ? '<div class="small muted">部位照片：' + esc(QUICK_PHOTO_POLICY) + '。</div>'
+      : '') +
+    '</div>'
+}
+
+function quickFileList() {
+  const files = state.quick.files
+  if (!files.length) {
+    return '<div class="empty-note">还没有选择文件。把照片、Word、PDF 拖进上面的方框，或点击“选择文件”。</div>'
+  }
+  const estimated = quickEstimateBytes()
+  const totalNote = '<div class="row" style="margin-bottom:8px">' +
+    badge('muted', '已选 ' + files.length + ' 个文件') +
+    badge('muted', '原始共 ' + quickSizeText(quickSelectedBytes())) +
+    badge('muted', 'base64 后约 ' + quickSizeText(estimated)) +
+    (estimated > QUICK_GATEWAY_LIMIT_BYTES ? badge('danger', '超过网关 64 MB 上限，可能被拒绝') : '') +
+    '<button type="button" class="btn btn-sm" data-act="quick-clear">清空已选</button></div>'
+  return totalNote + '<div class="quick-file-list">' + files.map(quickFileRow).join('') + '</div>'
+}
+
+function quickFormatPicker() {
+  const choice = quickFormatChoice(state.quick.formats)
+  const options = [['both', '两者都要（推荐）'], ['docx', '只要 Word（.docx）'], ['pdf', '只要 PDF']]
+  return '<div class="field"><span class="field-label">输出格式</span><div class="chips">' +
+    options.map((pair) =>
+      '<label class="chip chip-radio' + (choice === pair[0] ? ' is-active' : '') + '">' +
+      '<input type="radio" name="q-format" value="' + esc(pair[0]) + '"' +
+      (choice === pair[0] ? ' checked' : '') + ' data-quick-format />' + esc(pair[1]) + '</label>').join('') +
+    '</div><span class="hint">选择“只要 PDF”时，若服务端未安装 LibreOffice 会只得到 Word，并在结果页说明原因。</span></div>'
+}
+
+function quickOptionalFields() {
+  if (!state.quick.showOptional) {
+    return '<div class="quick-optional"><button type="button" class="btn btn-sm" data-act="quick-toggle-optional"' +
+      ' aria-expanded="false">展开可选项（案件编号 / 委托单位 / 姓名 / 备注）</button>' +
+      '<span class="hint" style="margin-left:8px">一般都是留空的：案件编号会自动生成，信息由系统从材料里读。</span></div>'
+  }
+  return '<div class="quick-optional"><button type="button" class="btn btn-sm" data-act="quick-toggle-optional"' +
+    ' aria-expanded="true">收起可选项</button>' +
+    '<div class="form-grid" style="margin-top:8px">' +
+    '<div class="field"><label for="q-case-no">案件编号（留空自动生成 FY-&lt;年份&gt;-&lt;序号&gt;）</label>' +
+    '<input id="q-case-no" class="input" maxlength="64" placeholder="可留空" data-quick-field="case_no" value="' +
+    esc(state.quick.case_no) + '" /></div>' +
+    '<div class="field"><label for="q-unit">委托单位</label>' +
+    '<input id="q-unit" class="input" maxlength="120" data-quick-field="commission_unit" value="' +
+    esc(state.quick.commission_unit) + '" /></div>' +
+    '<div class="field"><label for="q-name">姓名</label>' +
+    '<input id="q-name" class="input" maxlength="80" data-quick-field="subject_name" value="' +
+    esc(state.quick.subject_name) + '" /></div>' +
+    '<div class="field"><label for="q-note">备注（交给系统的一次性说明）</label>' +
+    '<input id="q-note" class="input" maxlength="500" data-quick-field="note" value="' +
+    esc(state.quick.note) + '" /></div>' +
+    '</div></div>'
+}
+
+function quickPhaseText() {
+  if (state.quick.running) {
+    const seconds = state.quick.startedAt
+      ? Math.max(1, Math.round((Date.now() - state.quick.startedAt) / 1000)) : 0
+    return (state.quick.phase || '整理中') + '…已用 ' + seconds + ' 秒（一次请求，服务端不回报百分比）'
+  }
+  if (state.quick.error) return '上次整理失败：' + state.quick.error
+  if (state.quick.result) return '已完成，请到「结果」页下载文稿。'
+  if (!state.quick.files.length) return '还没有选择文件'
+  return '准备就绪：' + quickFormatSummary(state.quick.formats) + '，点“开始整理”即可'
+}
+
+function setQuickPhaseText(text) {
+  const slot = $('#quick-phase')
+  if (slot) slot.textContent = text || ''
+}
+
+function updateQuickProgress() {
+  setQuickPhaseText(quickPhaseText())
+  const button = $('#quick-submit')
+  if (button) {
+    button.disabled = Boolean(state.quick.running) || !state.quick.files.length
+    button.textContent = state.quick.running ? ((state.quick.phase || '整理中') + '…') : '开始整理'
+  }
+}
+
+let quickTicker = null
+
+/** 单次请求拿不到真实进度，界面按预计阶段推进，并明确说明“不回报百分比”。 */
+function startQuickTicker() {
+  stopQuickTicker()
+  const phases = ['上传中', '识别中', '生成文稿']
+  state.quick.phase = phases[0]
+  let index = 0
+  quickTicker = window.setInterval(() => {
+    index = Math.min(index + 1, phases.length - 1)
+    state.quick.phase = phases[index]
+    updateQuickProgress()
+  }, 7000)
+}
+
+function stopQuickTicker() {
+  if (quickTicker) {
+    window.clearInterval(quickTicker)
+    quickTicker = null
+  }
+}
+
+function quickSubmitRow() {
+  const running = Boolean(state.quick.running)
+  const disabled = running || !state.quick.files.length
+  return '<div class="form-actions">' +
+    '<button id="quick-submit" type="button" class="btn btn-primary btn-lg" data-act="quick-run"' +
+    (disabled ? ' disabled' : '') + '>' + esc(running ? ((state.quick.phase || '整理中') + '…') : '开始整理') + '</button>' +
+    '<span id="quick-phase" class="quick-phase" aria-live="polite">' + esc(quickPhaseText()) + '</span>' +
+    '</div>' +
+    '<div class="callout callout-info" style="margin-top:8px">' +
+    '<strong>提交后会发生什么：</strong>文件一次性上传（浏览器 <code>FileReader</code> 读为 base64），' +
+    '服务端登记材料 → 推断类型与部位 → 提取字段与损伤 → 填入模板 → 生成 Word/PDF。' +
+    '一次请求完成，界面按“上传中 → 识别中 → 生成文稿”提示预计阶段，不会伪造百分比；' +
+    '期间请勿重复点击（按钮已禁用）。</div>'
+}
+
+function quickIntroCard() {
+  const steps = [
+    ['① 上传', '照片 / Word / PDF / JSON，可多选、可拖拽'],
+    ['② 选择输出', 'Word、PDF 或两者都要（默认两者）'],
+    ['③ 直接拿结果', '结果页显示产物与自动归类说明，可一键下载'],
+  ]
+  return '<div class="card quick-hero"><div class="card-head">' +
+    '<div class="card-title">整理：上传 → 结果' +
+    '<span class="badge badge-muted">POST ' + esc(QUICK_RUN_ENDPOINT) + '</span></div>' +
+    '<span class="card-sub">普通用户只需要这一页；核对与修改在次级界面「案件记录」</span></div>' +
+    '<div class="card-body"><div class="quick-steps">' +
+    steps.map((pair) => '<div class="quick-step"><strong>' + esc(pair[0]) + '</strong>' +
+      '<span class="small muted">' + esc(pair[1]) + '</span></div>').join('') +
+    '</div>' +
+    '<div class="callout callout-warn" style="margin-top:10px"><strong>部位照片（N-11）：</strong>' +
+    esc(QUICK_PHOTO_POLICY) + '。系统不对照片做识别、描述、分类或推断，既不运行 OCR 也不调用视觉模型。</div>' +
+    '<div class="callout callout-info" style="margin-top:8px">' +
+    '<strong>关于“自动判断”：</strong>类型与目标位置留空时由服务端按文件名推测，结果页会逐条标注' +
+    '「按文件名推断」，并给出“去案件记录修改”的入口；推测结果不影响原件（原件只读、永不覆盖）。</div>' +
+    '</div></div>'
+}
+
+function quickUploadCard() {
+  const running = Boolean(state.quick.running)
+  return '<div class="card"><div class="card-head">' +
+    '<div class="card-title">上传文件<span class="badge badge-muted">支持多选</span></div>' +
+    '<span class="card-sub">单个文件超过 30 MB 会提示；网关（nginx）单请求上限 64 MB</span></div>' +
+    '<div class="card-body">' +
+    '<div class="dropzone" data-dropzone data-act="quick-pick" tabindex="0" role="button"' +
+    ' aria-label="拖拽文件到此处，或按回车选择文件">' +
+    '<svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true" class="dropzone-icon">' +
+    '<path d="M12 17V5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>' +
+    '<path d="M7 10l5-5 5 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '<path d="M4 15v4h16v-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '</svg>' +
+    '<strong>把照片、Word、PDF 拖到这里</strong>' +
+    '<span class="muted">或点击本区域 / 按回车选择文件</span>' +
+    '<span class="hint">accept：' + esc(QUICK_ACCEPT) + '</span>' +
+    '<input id="q-file" class="visually-hidden-input" type="file" multiple accept="' + esc(QUICK_ACCEPT) +
+    '" data-quick-add aria-label="选择要整理的文件" />' +
+    '</div>' +
+    '</div>' +
+    '<div class="card-body">' + quickFileList() + '</div>' +
+    '<div class="card-body">' + quickFormatPicker() + quickOptionalFields() + '</div>' +
+    '<div class="card-body">' + quickSubmitRow() + '</div>' +
+    (running ? '' : '') +
+    '</div>'
+}
+
+function renderQuickView() {
+  const host = $('#view-quick')
+  if (!host) return
+  host.innerHTML = [
+    quickIntroCard(),
+    quickUploadCard(),
+    state.quick.error
+      ? '<div class="callout callout-danger"><strong>上次整理失败：</strong>' + esc(state.quick.error) +
+        '　已选文件仍保留，可直接重试，不会重复上传已成功的部分。</div>'
+      : '',
+  ].join('')
+}
+
+/* ------------------------------------------------------------------ 请求 */
+
+/** 直属 fetch 封装：`api.js` 是冻结文件，本次新增端点只在本文件内对接。 */
+async function postQuickRun(payload) {
+  const response = await fetch(QUICK_RUN_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok) {
+    let message = '请求失败 (' + response.status + ')'
+    try {
+      const body = await response.json()
+      if (typeof body.detail === 'string') message = body.detail
+      else if (Array.isArray(body.detail)) {
+        message = body.detail.map((item) => (item && item.msg ? item.msg : JSON.stringify(item))).join('；')
+      }
+    } catch (error) { /* 无 JSON 正文时保留 HTTP 兜底文案 */ }
+    const error = new Error(message)
+    error.status = response.status
+    throw error
+  }
+  return response.json()
+}
+
+/** 响应归一化：契约字段缺失时降级为“未记录”而不是编造（N-5）。 */
+function normalizeQuickResult(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {}
+  return {
+    raw: source,
+    case_id: num(source.case_id, 0),
+    case_no: source.case_no || '',
+    stage: source.stage || '',
+    steps: Array.isArray(source.steps) ? source.steps : [],
+    assignments: Array.isArray(source.assignments) ? source.assignments : [],
+    summary: source.summary && typeof source.summary === 'object' ? source.summary : {},
+    documents: Array.isArray(source.documents) ? source.documents : [],
+    notes: Array.isArray(source.notes) ? source.notes.filter((item) => typeof item === 'string') : [],
+    case_url: typeof source.case_url === 'string' ? source.case_url : '',
+  }
+}
+
+function handleQuickError(error) {
+  const status = error && error.status ? error.status : 0
+  const detail = (error && error.message) ? error.message : String(error || '未知错误')
+  if (status === 404) {
+    pushBanner('warn', '<strong>整理接口未就绪（404）</strong>：服务端尚未提供 <code>POST ' +
+      esc(QUICK_RUN_ENDPOINT) + '</code>。已选文件仍保留；可改用「案件记录」里的四步流程完成同样的工作。' +
+      '　<button type="button" class="btn btn-sm" data-act="nav" data-view="cases">去案件记录</button>')
+    toast('warn', '整理接口未就绪（404）', '服务端未实现 POST ' + QUICK_RUN_ENDPOINT + '：' + detail +
+      '；未上传任何文件，已选列表保持不变。')
+    return
+  }
+  if (status === 413) {
+    toast('err', '文件过大（413）', '请求体超过网关上限（64 MB）。请减少文件数量或压缩图片后重试；' +
+      '已选列表保持不变。服务端提示：' + detail)
+    return
+  }
+  handleApiError(error, '开始整理')
+}
+
+/* ------------------------------------------------------------ 文件选择 */
+
+function addQuickFiles(fileList) {
+  const incoming = Array.from(fileList || [])
+  if (!incoming.length) return
+  const seen = {}
+  state.quick.files.forEach((item) => {
+    seen[item.name + '|' + item.size + '|' + num(item.file.lastModified, 0)] = true
+  })
+  const skipped = []
+  const big = []
+  let added = 0
+  incoming.forEach((file) => {
+    const key = (file.name || '') + '|' + num(file.size, 0) + '|' + num(file.lastModified, 0)
+    if (seen[key]) { skipped.push(file.name || '未命名文件'); return }
+    seen[key] = true
+    state.quickSeq += 1
+    const size = num(file.size, 0)
+    state.quick.files.push({
+      id: state.quickSeq,
+      file: file,                       // 浏览器 File 对象本身：重渲染不丢文件
+      name: file.name || '未命名文件',
+      size: size,
+      media_type: mediaTypeOf(file),
+      kind: '',                         // 默认“自动判断”：kind 留空交后端推断
+      position_key: '',
+      oversize: size > QUICK_MAX_FILE_BYTES,
+    })
+    added += 1
+    if (size > QUICK_MAX_FILE_BYTES) big.push((file.name || '未命名文件') + '（' + quickSizeText(size) + '）')
+  })
+  state.quick.error = ''
+  if (skipped.length) toast('warn', '已跳过重复文件', skipped.join('、'))
+  if (big.length) {
+    toast('warn', '文件较大（>30 MB）', big.join('、') +
+      '：上传会明显变慢；网关（nginx）单请求上限 64 MB，超过会被拒绝。')
+  }
+  if (quickEstimateBytes() > QUICK_GATEWAY_LIMIT_BYTES) {
+    toast('warn', '预计超过网关上限', 'base64 后约 ' + quickSizeText(quickEstimateBytes()) +
+      '，超过 64 MB 网关上限，请分批整理。')
+  }
+  if (added) toast('ok', '已加入待整理列表', '共 ' + added + ' 个文件；类型默认“自动判断”，可在下方逐项修改。')
+}
+
+function removeQuickFile(id) {
+  state.quick.files = state.quick.files.filter((item) => num(item.id, 0) !== num(id, 0))
+  render()
+}
+
+function pickQuickFiles() {
+  const input = $('#q-file')
+  if (input) input.click()
+}
+
+function quickReset() {
+  stopQuickTicker()
+  state.quick.files = []
+  state.quick.result = null
+  state.quick.error = ''
+  state.quick.phase = ''
+  state.quick.startedAt = 0
+  state.quick.running = false
+  state.quick.case_no = ''            // 案件编号必须清空，否则会撞“编号已存在”
+  setView('quick')
+}
+
+/* ------------------------------------------------------------ 提交整理 */
+
+async function submitQuickRun() {
+  if (state.quick.running) {
+    toast('warn', '正在整理中', '请等待当前整理完成，不要重复提交。')
+    return
+  }
+  const picked = state.quick.files
+  if (!picked.length) {
+    toast('warn', '还没有选择文件', '请先拖入或选择照片、Word、PDF 等文件。')
+    return
+  }
+  const view = $('#view-quick')
+  if (view) {
+    const fields = collect(view, 'data-quick-field')
+    state.quick.case_no = (fields.case_no || state.quick.case_no || '').trim()
+    state.quick.commission_unit = (fields.commission_unit || state.quick.commission_unit || '').trim()
+    state.quick.subject_name = (fields.subject_name || state.quick.subject_name || '').trim()
+    state.quick.note = (fields.note || state.quick.note || '').trim()
+  }
+  state.quick.running = true
+  state.quick.error = ''
+  state.quick.result = null
+  state.quick.startedAt = Date.now()
+  state.quick.phase = '读取文件'
+  render()
+  try {
+    const files = []
+    for (let index = 0; index < picked.length; index += 1) {
+      const item = picked[index]
+      setQuickPhaseText('读取文件 ' + (index + 1) + '/' + picked.length + '：' + item.name)
+      const content_base64 = await readFileAsBase64(item.file)
+      files.push({
+        filename: item.name,
+        media_type: item.media_type,
+        content_base64: content_base64,
+        kind: item.kind,
+        position_key: item.kind === 'photo' ? item.position_key : '',
+      })
+    }
+    const payload = buildQuickRunPayload(files, {
+      formats: state.quick.formats,
+      case_no: state.quick.case_no,
+      commission_unit: state.quick.commission_unit,
+      subject_name: state.quick.subject_name,
+      note: state.quick.note,
+    })
+    startQuickTicker()
+    const response = await withLoading(() => postQuickRun(payload))
+    stopQuickTicker()
+    state.quick.result = normalizeQuickResult(response)
+    state.quick.running = false
+    state.quick.phase = ''
+    state.quick.files = []              // 成功后才清空已选；失败一律保留
+    const result = state.quick.result
+    try { await loadCases(); await loadStats() } catch (error) { /* 列表刷新失败不影响结果页 */ }
+    if (!result.documents.length) {
+      toast('warn', '整理已返回，但没有文稿', '请查看结果页的说明与处理步骤；可到「案件记录」检查材料与模板。')
+    } else {
+      toast('ok', '整理完成', '案件 ' + (result.case_no || ('#' + result.case_id)) + '：生成 ' +
+        result.documents.length + ' 份文稿；待处理疑点 ' + num(result.summary.unresolved_count, 0) + ' 条。')
+    }
+    setView('results')
+    return
+  } catch (error) {
+    stopQuickTicker()
+    state.quick.running = false
+    state.quick.phase = ''
+    state.quick.error = (error && error.message) ? error.message : String(error || '未知错误')
+    handleQuickError(error)
+    render()
+    return
+  }
+}
+
+/* ------------------------------------------------------------ 结果视图 */
+
+function quickResultHeader(result) {
+  const caseId = num(result.case_id, 0)
+  const sameOriginUrl = result.case_url && quickUrlAllowed(result.case_url) ? result.case_url : ''
+  return '<div class="card quick-hero"><div class="card-head">' +
+    '<div class="card-title">' +
+    '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">' +
+    '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/>' +
+    '<path d="M8 12.5l2.6 2.6L16 9.6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '</svg>整理完成' +
+    (result.case_no ? '<span class="badge badge-info">' + esc(result.case_no) + '</span>'
+      : '<span class="badge badge-warn">案件编号未记录</span>') +
+    (result.stage ? badge('muted', '阶段：' + labelOf(state.cfg.stage_labels, result.stage)) : '') +
+    '</div>' +
+    '<div class="btn-row">' +
+    (caseId ? '<button type="button" class="btn btn-sm btn-primary" data-act="results-open-case" data-id="' + caseId +
+      '">查看案件记录</button>' : '') +
+    '<button type="button" class="btn btn-sm" data-act="quick-again">再整理一批</button>' +
+    '</div></div>' +
+    '<div class="card-body">' +
+    '<p class="small muted">文稿已生成，可直接用下面的按钮下载。系统不生成鉴定意见（N-1）；' +
+    '空白栏目一律是“未记录”，绝不写成“未见异常”（N-5）。</p>' +
+    (sameOriginUrl
+      ? '<p class="small">服务端案件地址：<a href="' + esc(sameOriginUrl) + '">' + esc(sameOriginUrl) + '</a>' +
+        '（同源地址，仅本机/内网可访问）</p>'
+      : '') +
+    (result.summary && num(result.summary.blocking_count, 0) > 0
+      ? '<div class="callout callout-danger"><strong>存在阻断项，不能生成待签发稿，请到案件记录处理。</strong>' +
+        '阻断项 ' + num(result.summary.blocking_count, 0) + ' 条。</div>'
+      : '') +
+    '</div></div>'
+}
+
+function quickDocumentItem(doc) {
+  const document_ = doc || {}
+  const docxUrl = quickDownloadUrl(document_, 'docx')
+  const pdfUrl = quickDownloadUrl(document_, 'pdf')
+  const hasDocx = quickHasFormat(document_, 'docx')
+  const hasPdf = quickHasFormat(document_, 'pdf')
+  const docxName = document_.filename_docx || ''
+  const pdfName = document_.filename_pdf || ''
+  const pdfReason = '本次未导出 PDF：服务端 LibreOffice 不可用或导出失败（校核项 DOCUMENT_PDF_MISSING）。' +
+    'Word 仍可下载；可在「案件记录 → 文稿」重新生成后再取 PDF。'
+  const blocked = document_.blocked_reason ? String(document_.blocked_reason) : ''
+  const docxButton = (hasDocx && docxUrl)
+    ? '<a class="btn btn-primary" href="' + esc(docxUrl) + '" download>下载 Word（.docx）</a>'
+    : '<button type="button" class="btn" disabled title="' +
+      esc(hasDocx ? '服务端未返回可用的下载地址' : '本次未生成 Word 文件') + '">Word 不可用</button>'
+  const pdfButton = (hasPdf && pdfUrl)
+    ? '<a class="btn btn-primary" href="' + esc(pdfUrl) + '" download>下载 PDF</a>'
+    : '<button type="button" class="btn" disabled title="' + esc(pdfReason) + '">PDF 不可用</button>'
+  return '<div class="doc-item"><div class="doc-head">' +
+    '<div><span class="doc-name">' + esc(docxName || pdfName || ('文稿 #' + num(document_.id, 0))) + '</span>' +
+    '<div class="row" style="margin-top:4px">' +
+    badge('info', labelOf(state.cfg.doc_status_labels, document_.doc_status, document_.doc_status || '未记录')) +
+    badge('muted', '版本 v' + num(document_.version_no, 1)) +
+    badge('muted', '类型 ' + esc(document_.doc_type || '未记录')) +
+    (hasDocx ? badge('ok', 'Word 已生成') : badge('muted', '无 Word')) +
+    (hasPdf ? badge('ok', 'PDF 已生成') : badge('warn', '无 PDF')) +
+    '</div></div>' +
+    '<div class="btn-row">' + docxButton + pdfButton + '</div>' +
+    '</div>' +
+    '<div class="kv" style="margin-top:6px">' +
+    '<span class="k">Word 文件名</span><span>' + valHtml(docxName) + '</span>' +
+    '<span class="k">PDF 文件名</span><span>' + valHtml(pdfName) + '</span>' +
+    '</div>' +
+    (hasPdf ? '' : '<div class="callout callout-warn" style="margin-top:8px">' + esc(pdfReason) + '</div>') +
+    (blocked ? '<div class="callout callout-danger" style="margin-top:8px">服务端阻断原因：' + esc(blocked) + '</div>' : '') +
+    (hasDocx && hasPdf && !blocked ? '' : '') +
+    '</div>'
+}
+
+function quickDocumentsCard(result) {
+  const documents = result.documents
+  if (!documents.length) {
+    return '<div class="card"><div class="card-head"><div class="card-title">产物（Word / PDF）</div>' +
+      '<span class="badge badge-warn">本次 0 份</span></div><div class="card-body">' +
+      '<div class="callout callout-warn">服务端本次没有返回任何文稿。常见原因：缺少报告模板（template 材料）、' +
+      '所有材料都未能识别、或渲染被阻断。请到「案件记录」核对材料清单与校核清单（notes 与处理步骤见下）。</div>' +
+      '</div></div>'
+  }
+  return '<div class="card"><div class="card-head"><div class="card-title">产物（Word / PDF）' +
+    '<span class="badge badge-muted">' + documents.length + ' 份</span></div>' +
+    '<span class="card-sub">下载地址来自响应 download_urls，缺失时回退 GET /api/documents/{id}/download?fmt=</span></div>' +
+    '<div class="card-body">' + documents.map(quickDocumentItem).join('') + '</div></div>'
+}
+
+function quickSummaryCard(result) {
+  const summary = result.summary || {}
+  const blocking = num(summary.blocking_count, 0)
+  const cards = [
+    { label: '材料', value: num(summary.material_count, 0) },
+    { label: '字段', value: num(summary.field_count, 0) },
+    { label: '损伤', value: num(summary.injury_count, 0) },
+    { label: '文稿', value: num(summary.document_count, 0) },
+    { label: '待处理疑点', value: num(summary.unresolved_count, 0), cls: 'is-warn' },
+    { label: '阻断项', value: blocking, cls: blocking ? 'is-danger' : '' },
+  ]
+  const body = cards.map((item) =>
+    '<div class="stat-card"><div class="stat-value ' + (item.cls || '') + '">' + item.value + '</div>' +
+    '<div class="stat-label">' + esc(item.label) + '</div></div>').join('')
+  return '<div class="card"><div class="card-head"><div class="card-title">摘要</div>' +
+    '<span class="row">' + badge('warn', '警告 ' + num(summary.warning_count, 0)) +
+    badge('muted', '提示 ' + num(summary.info_count, 0)) + '</span></div>' +
+    '<div class="card-body"><div class="stat-grid">' + body + '</div>' +
+    (blocking
+      ? '<div class="callout callout-danger" style="margin-top:8px"><strong>存在阻断项，不能生成待签发稿，请到案件记录处理。</strong></div>'
+      : '<div class="callout callout-ok" style="margin-top:8px">没有阻断项；待处理疑点 ' +
+        num(summary.unresolved_count, 0) + ' 条仍需专业人员核对后才能签发。</div>') +
+    '</div></div>'
+}
+
+function quickAssignmentsCard(result) {
+  const rows = result.assignments
+  if (!rows.length) return ''
+  const caseId = num(result.case_id, 0)
+  const body = rows.map((item) => {
+    const isPhoto = item.kind === 'photo'
+    const kindLabel = item.kind_label || labelOf(state.cfg.material_kind_labels, item.kind, '未记录')
+    const kindFlag = item.kind_inferred === undefined
+      ? badge('muted', '来源未标注')
+      : (item.kind_inferred ? badge('warn', '按文件名推断，可修改') : badge('ok', '已指定'))
+    const positionCell = isPhoto
+      ? (item.position_key
+        ? esc(item.position_label || labelOf(positionLabelMap(), item.position_key)) +
+          (item.position_inferred ? ' ' + badge('warn', '按文件名推测') : ' ' + badge('ok', '已指定'))
+        : valHtml(item.position_label) + ' ' + badge('danger', '未指定位置：不会进入文稿'))
+      : '<span class="muted">不适用</span>'
+    const reasons = []
+    if (item.kind_reason) reasons.push('类型：' + item.kind_reason)
+    if (isPhoto && item.position_reason) reasons.push('位置：' + item.position_reason)
+    return '<tr>' +
+      '<td class="nowrap"><strong>' + esc(item.filename || '未命名文件') + '</strong>' +
+      (reasons.length ? '<div class="small muted">' + esc(reasons.join('；')) + '</div>' : '') + '</td>' +
+      '<td>' + esc(kindLabel) + ' ' + kindFlag + '</td>' +
+      '<td>' + positionCell + '</td>' +
+      '<td>' + (caseId
+        ? '<button type="button" class="btn btn-sm" data-act="results-open-case" data-id="' + caseId +
+          '" data-goto="' + (isPhoto ? 'photo' : 'materials') + '">去案件记录修改</button>'
+        : '<span class="muted small">缺少 case_id</span>') + '</td>' +
+      '</tr>'
+  }).join('')
+  return '<div class="card"><div class="card-head"><div class="card-title">自动归类说明' +
+    '<span class="badge badge-muted">' + rows.length + ' 个文件</span></div>' +
+    '<span class="card-sub">标注“按文件名推断，可修改”的条目请到案件记录确认</span></div>' +
+    '<div class="table-wrap"><table class="table"><thead><tr>' +
+    '<th>文件</th><th>类型</th><th>目标位置（仅部位照片）</th><th>操作</th>' +
+    '</tr></thead><tbody>' + body + '</tbody></table></div></div>'
+}
+
+function quickStepsCard(result) {
+  if (!result.steps.length) return ''
+  return '<div class="card"><div class="card-head"><div class="card-title">服务端处理步骤' +
+    '<span class="badge badge-muted">steps</span></div></div><div class="card-body">' +
+    result.steps.map((step) => '<div class="quick-step-row">' +
+      (step && step.ok ? badge('ok', '完成') : badge('danger', '未完成')) +
+      '<span><strong>' + esc((step && step.step) || '未记录') + '</strong>' +
+      ((step && step.detail) ? '<span class="small muted">：' + esc(step.detail) + '</span>' : '') + '</span>' +
+      '</div>').join('') +
+    '</div></div>'
+}
+
+function quickNotesCard(result) {
+  if (!result.notes.length) return ''
+  return '<div class="card"><div class="card-head"><div class="card-title">系统说明（notes）</div>' +
+    '<span class="card-sub">未提供模板、PDF 导出失败原因、照片栏位提示等</span></div>' +
+    '<div class="card-body"><ul class="note-list">' +
+    result.notes.map((note) => '<li>' + esc(note) + '</li>').join('') +
+    '</ul></div></div>'
+}
+
+function renderResultsView() {
+  const host = $('#view-results')
+  if (!host) return
+  const result = state.quick.result
+  if (!result) {
+    host.innerHTML = '<div class="card"><div class="card-head"><div class="card-title">结果</div></div>' +
+      '<div class="card-body"><div class="empty-note">还没有整理结果。到「整理」页上传文件，' +
+      '完成后会自动跳到本页。</div>' +
+      '<div class="form-actions"><button type="button" class="btn btn-primary" data-act="nav" data-view="quick">' +
+      '去整理</button></div></div></div>'
+    return
+  }
+  host.innerHTML = [
+    quickResultHeader(result),
+    quickDocumentsCard(result),
+    quickSummaryCard(result),
+    quickAssignmentsCard(result),
+    quickStepsCard(result),
+    quickNotesCard(result),
+  ].join('')
+}
+
+/* ==========================================================================
+ * 18c. 次级界面「复核中心」：只用既有端点，汇总“还有哪些案件需要人处理”
+ * ========================================================================== */
+
+async function loadReviewCenter() {
+  const blocking = await api.listCases({ has_blocking: 'true', page: 1, page_size: 100 })
+  const recent = await api.listCases({ page: 1, page_size: 100 })
+  state.review.blocking = Array.isArray(blocking && blocking.items) ? blocking.items : []
+  const items = Array.isArray(recent && recent.items) ? recent.items.slice() : []
+  items.sort((a, b) => num(b.unresolved_count, 0) - num(a.unresolved_count, 0))
+  state.review.top = items.filter((item) => num(item.unresolved_count, 0) > 0).slice(0, 12)
+  state.review.loaded = true
+  state.review.error = ''
+}
+
+function reviewTable(items, reason, emptyText) {
+  if (!items.length) return '<div class="empty-note">' + esc(emptyText) + '</div>'
+  const rows = items.map((item) => {
+    const unresolved = num(item.unresolved_count, 0)
+    const blocking = num(item.blocking_count, 0)
+    return '<tr>' +
+      '<td class="nowrap"><strong>' + esc(item.case_no || '未编号') + '</strong>' +
+      '<div class="small muted">ID ' + num(item.id, 0) + ' · v' + num(item.version, 1) + '</div></td>' +
+      '<td>' + valHtml(item.subject_name) + '</td>' +
+      '<td>' + valHtml(item.commission_unit) + '</td>' +
+      '<td>' + badge('info', labelOf(state.cfg.stage_labels, item.stage)) + '</td>' +
+      '<td class="num">' + (unresolved ? badge('warn', String(unresolved)) : '0') + '</td>' +
+      '<td class="num">' + (blocking ? badge('danger', String(blocking)) : '0') + '</td>' +
+      '<td class="small">' + esc(reason) + '</td>' +
+      '<td><button type="button" class="btn btn-sm btn-primary" data-act="case-open" data-id="' +
+      num(item.id, 0) + '">打开工作台</button></td>' +
+      '</tr>'
+  }).join('')
+  return '<div class="table-wrap"><table class="table"><thead><tr>' +
+    '<th>案件编号</th><th>姓名</th><th>委托单位</th><th>阶段</th><th class="num">待核对</th>' +
+    '<th class="num">阻断</th><th>排序依据</th><th>操作</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+}
+
+function renderReviewView() {
+  const host = $('#view-review')
+  if (!host) return
+  const review = state.review
+  if (!review.loaded) {
+    host.innerHTML = '<div class="card"><div class="card-body"><div class="empty-note">正在加载复核概览…</div>' +
+      '<div class="form-actions"><button type="button" class="btn btn-primary" data-act="review-reload">加载复核概览</button>' +
+      '</div></div></div>'
+    return
+  }
+  host.innerHTML = [
+    statCards(),
+    '<div class="card"><div class="card-head"><div class="card-title">存在未解决阻断项的案件' +
+    '<span class="badge badge-danger">GET /api/cases?has_blocking=true</span></div>' +
+    '<button type="button" class="btn btn-sm" data-act="review-reload">刷新</button></div>' +
+    '<div class="card-body">' +
+    reviewTable(review.blocking || [], '服务端筛选 has_blocking=true（最多 100 件）',
+      '当前没有未解决阻断项的案件。') +
+    '</div></div>',
+    '<div class="card"><div class="card-head"><div class="card-title">待核对最多的案件' +
+    '<span class="badge badge-warn">前端排序（最多 100 件内）</span></div></div>' +
+    '<div class="card-body">' +
+    reviewTable(review.top || [], '按 unresolved_count 降序（仅用于安排复核顺序）',
+      '最近 100 件里没有待核对字段或损伤。') +
+    '<div class="callout callout-info" style="margin-top:8px">排序在前端完成，不是服务端统计；' +
+    '“待核对”数量可能包含待确认字段与待核对损伤，具体条目请打开案件工作台。</div>' +
+    '</div></div>',
+  ].join('')
+}
+
+/* ==========================================================================
  * 19. 事件处理（统一委托：click / change / input / keydown / submit）
  * ========================================================================== */
 
@@ -2220,7 +3103,92 @@ async function onClick(event) {
       if (view === 'rules' && !state.rulesLoaded) {
         await guarded(() => loadRules(), '加载术语规则')
       }
+      if (view === 'review' && !state.review.loaded) {
+        const ok = await guarded(() => loadReviewCenter(), '加载复核概览')
+        if (!ok) state.review.error = '加载失败'
+      }
       setView(view)
+      return
+    }
+    case 'quick-pick': {
+      // 文件框自身的点击不再冒泡触发本动作，避免无限递归打开对话框
+      if (event.target && event.target.id === 'q-file') return
+      pickQuickFiles()
+      return
+    }
+    case 'quick-clear': {
+      if (!state.quick.files.length) return
+      state.quick.files = []
+      toast('ok', '已清空待整理列表', '可以重新选择文件。')
+      render()
+      return
+    }
+    case 'quick-remove': {
+      removeQuickFile(node.dataset.id)
+      return
+    }
+    case 'quick-kind': {
+      const id = intOr(node.dataset.id, 0)
+      const kind = node.dataset.kind || ''
+      state.quick.files.forEach((item) => {
+        if (num(item.id, 0) === id) {
+          item.kind = kind
+          // 部位照片之外不发送 position_key（后端会 400）
+          if (kind !== 'photo') item.position_key = ''
+        }
+      })
+      render()
+      return
+    }
+    case 'quick-toggle-optional': {
+      state.quick.showOptional = !state.quick.showOptional
+      render()
+      return
+    }
+    case 'quick-run': {
+      await submitQuickRun()
+      return
+    }
+    case 'quick-again': {
+      quickReset()
+      return
+    }
+    case 'review-reload': {
+      const ok = await guarded(() => loadReviewCenter(), '加载复核概览')
+      if (!ok) state.review.error = '加载失败'
+      render()
+      return
+    }
+    case 'results-open-case':
+    case 'quick-open-case': {
+      const id = intOr(node.dataset.id, 0)
+      if (!id) {
+        toast('warn', '缺少案件 ID', '服务端响应里没有 case_id，无法打开案件记录。')
+        return
+      }
+      state.preview = null
+      state.checklistItems = null
+      state.ocrPage = 1
+      state.ocrFilterMaterial = ''
+      state.normalizeResult = null
+      state.stageResult = null
+      const data = await guarded(async () => {
+        const result = await loadCase(id)
+        await loadPhotoSlots()
+        await loadOcrBlocks()
+        await loadChecklist()
+        return result
+      }, '打开案件')
+      if (!data) { render(); return }
+      state.step = 1
+      setView('case')
+      if (node.dataset.goto === 'photo') {
+        const panel = $('#panel-photo')
+        if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: 'start' })
+      } else if (node.dataset.goto === 'materials') {
+        const panel = $('#panel-materials')
+        if (panel && panel.scrollIntoView) panel.scrollIntoView({ block: 'start' })
+      }
       return
     }
     case 'dismiss-banner': {
@@ -3053,6 +4021,25 @@ async function onChange(event) {
     if (count) toast('ok', '已选择文件', '共 ' + count + ' 个文件待上传（浏览器 FileReader 读为 base64）。')
     return
   }
+  if (node.matches('[data-quick-add]')) {
+    addQuickFiles(node.files)
+    node.value = ''            // 允许再次选择同一个文件
+    render()
+    return
+  }
+  if (node.matches('[data-quick-format]')) {
+    state.quick.formats = quickFormatsFromChoice(node.value)
+    render()
+    return
+  }
+  if (node.matches('[data-quick-position]')) {
+    const id = intOr(node.getAttribute('data-quick-position'), 0)
+    state.quick.files.forEach((item) => {
+      if (num(item.id, 0) === id) item.position_key = node.value || ''
+    })
+    setQuickPhaseText(quickPhaseText())
+    return
+  }
 }
 
 /* ---------------------------------------------------------------- input */
@@ -3063,6 +4050,12 @@ function onInput(event) {
   if (node.matches('[data-act="api-key"]')) {
     // 只写入内存变量；不落 localStorage，也不写回 DOM 属性。
     state.apiKey = node.value
+    return
+  }
+  if (node.matches('[data-quick-field]')) {
+    // 与内存同步，避免重渲染丢失用户输入
+    const key = node.getAttribute('data-quick-field')
+    if (key && Object.prototype.hasOwnProperty.call(state.quick, key)) state.quick[key] = node.value
   }
 }
 
@@ -3072,6 +4065,18 @@ async function onKeydown(event) {
   if (event.key !== 'Enter') return
   const node = event.target
   if (!node) return
+  if (state.view === 'quick' && node.closest && node.closest('#view-quick')) {
+    if (node.type === 'file') return                       // 文件框的回车交给浏览器
+    if (node.dataset && node.dataset.act === 'quick-pick') { // 拖拽区：回车 = 选择文件
+      event.preventDefault()
+      pickQuickFiles()
+      return
+    }
+    if (node.tagName === 'BUTTON' || node.tagName === 'A') return  // 自带 click 语义
+    event.preventDefault()
+    await submitQuickRun()
+    return
+  }
   if (node.id === 'f-search' || node.id === 'ck-cat') {
     event.preventDefault()
     const host = $('#view-cases')
@@ -3094,6 +4099,53 @@ function onSubmit(event) {
   event.preventDefault()
 }
 
+/* -------------------------------------------------------------- drag/drop */
+
+function dropZoneOf(event) {
+  const node = event.target
+  if (!node || !node.closest) return null
+  return node.closest('[data-dropzone]')
+}
+
+function onDragEnter(event) {
+  const zone = dropZoneOf(event)
+  if (!zone) return
+  event.preventDefault()
+  zone.classList.add('is-drag')
+}
+
+function onDragOver(event) {
+  const zone = dropZoneOf(event)
+  if (!zone) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+  zone.classList.add('is-drag')
+}
+
+function onDragLeave(event) {
+  const zone = dropZoneOf(event)
+  if (!zone) return
+  if (event.relatedTarget && zone.contains(event.relatedTarget)) return
+  zone.classList.remove('is-drag')
+}
+
+function onDrop(event) {
+  const zone = dropZoneOf(event)
+  // 无论落在哪里都要阻止浏览器直接打开文件（避免丢失当前页面状态）
+  event.preventDefault()
+  if (!zone) return
+  zone.classList.remove('is-drag')
+  const files = (event.dataTransfer && event.dataTransfer.files)
+    ? Array.from(event.dataTransfer.files) : []
+  if (!files.length) {
+    toast('warn', '没有读到文件', '如果是文件夹或浏览器不支持的类型，请改用“选择文件”按钮。')
+    return
+  }
+  if (state.view !== 'quick') setView('quick')
+  addQuickFiles(files)
+  render()
+}
+
 /* ==========================================================================
  * 20. 启动
  * ========================================================================== */
@@ -3104,6 +4156,11 @@ async function bootstrap() {
   document.addEventListener('input', (event) => { onInput(event) })
   document.addEventListener('keydown', (event) => { void onKeydown(event) })
   document.addEventListener('submit', onSubmit)
+  // 拖拽上传：只在主视图「整理」的拖拽区生效，drop 一律阻止浏览器打开文件
+  document.addEventListener('dragenter', onDragEnter)
+  document.addEventListener('dragover', onDragOver)
+  document.addEventListener('dragleave', onDragLeave)
+  document.addEventListener('drop', onDrop)
 
   const failures = []
   try {
@@ -3131,7 +4188,8 @@ async function bootstrap() {
     failures.push('stats')
   }
   state.booted = true
-  setView('cases')
+  // 默认打开主视图「整理」：普通用户只需要“上传 → 结果”（Transparent）
+  setView('quick')
   if (failures.length) {
     toast('warn', '部分接口不可用', '失败项：' + failures.join('、') + '（其余界面仍可使用）')
   }
@@ -3142,6 +4200,29 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   window.addEventListener('DOMContentLoaded', () => { void bootstrap() })
 }
 
-/* 供静态自检脚本读取（不影响浏览器运行） */
-export const __workbenchInternals = { ENDPOINT_MANIFEST, normalizeConfig }
+/* 供静态自检脚本读取（不影响浏览器运行）：纯函数与契约常量，可在 Node 中直接断言。
+ * `renderQuickView` / `renderResultsView` / `quickState` / `setQuickResult` 只用于
+ * %TEMP% 的离线冒烟脚本在无浏览器环境下核对渲染出的 HTML，浏览器中不经过它们。 */
+export const __workbenchInternals = {
+  ENDPOINT_MANIFEST,
+  QUICK_RUN_ENDPOINT,
+  QUICK_KIND_CHIPS,
+  QUICK_ACCEPT,
+  QUICK_PHOTO_POLICY,
+  QUICK_MAX_FILE_BYTES,
+  QUICK_GATEWAY_LIMIT_BYTES,
+  normalizeConfig,
+  buildQuickRunPayload,
+  quickFormatsFromChoice,
+  quickFormatChoice,
+  quickDownloadUrl,
+  quickHasFormat,
+  quickPhaseText,
+  mediaTypeOf,
+  normalizeQuickResult,
+  renderQuickView,
+  renderResultsView,
+  quickState: () => state.quick,
+  setQuickResult: (result) => { state.quick.result = result },
+}
 
