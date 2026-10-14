@@ -1,5 +1,32 @@
 # 部署到服务器（Ubuntu / Debian）
 
+## 0. 实测记录（2026-10-14，阿里云 VPS 47.251.245.125，Ubuntu 22.04 / 1.6 GB 内存）
+
+按第 1 节脚本部署并逐项验证通过：
+
+| 验证项 | 结果 |
+| --- | --- |
+| 系统依赖 | `python3-venv`、`libreoffice-writer`、`fonts-noto-cjk` 安装成功，`soffice=/usr/bin/soffice` |
+| Python 环境 | venv + `requirements.txt`（含 `PyMuPDF`）安装成功，Python 3.10.12 |
+| systemd | `forensic-doc-agent` 已 enable + running，只监听 `127.0.0.1:9765`，常驻内存约 41 MB |
+| 演示案件 | `demo_pipeline` 生成 `FY-2026-0002-report-v1.docx` + `.pdf`：3 张部位照片按栏位插入、18 个照片栏位、15 处「（未提供照片）」、0 占位符残留 |
+| PDF 中文渲染 | 5 页、595 个中文字符、PDF 内嵌 `NotoSansCJKjp-*` 字体（证明中文未变方框） |
+| PDF 材料处理（R-18） | `probe()` / `extract_pdf_text()` / `render_pdf_pages()` 对上传的 PDF 正常，页面图像渲染成功 |
+| 红线 N-11 | 照片材料 8 张，`ocr_blocks` 恒为 0 |
+| 隧道访问 | `ssh -L 9765:127.0.0.1:9765` 后 `GET /` 200（工作台）、`/api/health` ok、`/api/config` 18 个位置、`GET /api/documents/1/download?fmt=docx` 200（58 KB，正确 MIME） |
+
+部署时对基础设施做的两处改动（如需回退）：
+
+1. **新增 1 GB swap**（1.6 GB 内存 + LibreOffice 出 PDF 时有 OOM 风险）：
+   回退 `swapoff /swapfile && rm /swapfile`，并删掉 `/etc/fstab` 里的 `/swapfile` 行。
+2. 未改动 Docker/nginx/防火墙/安全组：服务只监听回环，对外靠 SSH 隧道。
+
+另外本次部署暴露并已修复两处工程问题（见提交记录）：
+`requirements.txt` 补 `PyMuPDF`（否则服务器上 PDF 材料无法渲染/读取文字层）；
+`deploy/install.sh` 修 git ownership 与工作目录问题。
+
+---
+
 本文件是「把服务放到服务器上并让浏览器访问」的完整说明。核心约束先写在最前面：
 
 > **应用自身没有登录鉴权。** `expected_version` 是乐观锁（防止旧结果覆盖新操作），不是权限控制；
