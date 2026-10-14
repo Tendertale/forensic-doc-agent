@@ -1,0 +1,38 @@
+[Unit]
+# 法医尸表检验文书整理 Agent（FastAPI + 无构建工作台）
+# 由 deploy/install.sh 落地到 /etc/systemd/system/forensic-doc-agent.service
+Description=法医尸表检验文书整理 Agent (FastAPI, 127.0.0.1 only)
+Documentation=file://@APP_DIR@/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_USER@
+WorkingDirectory=@APP_DIR@
+
+# 数据与代码分离：数据库、案件附件、LibreOffice 用户配置都放在 @DATA_DIR@
+Environment=FORENSIC_DB_PATH=@DATA_DIR@/cases.db
+Environment=FORENSIC_STORAGE_ROOT=@DATA_DIR@/storage
+Environment=HOME=@DATA_DIR@/home
+Environment=PYTHONUNBUFFERED=1
+
+# 只监听回环：对外访问走 SSH 隧道或 Nginx 反代（应用自身没有鉴权）
+ExecStart=@APP_DIR@/.venv/bin/python -m backend.scripts.serve --host 127.0.0.1 --port @PORT@ --no-seed
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+# 加固：不可提权、/usr 与 /etc 只读、私有 /tmp、仅数据目录可写
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=@DATA_DIR@
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
