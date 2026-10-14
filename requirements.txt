@@ -11,3 +11,6 @@ httpx>=0.28
 python-docx>=1.1
 Pillow>=11.0
 Jinja2>=3.1
+# PDF 扫描件的文字读取与页面渲染（R-18）：优先 pypdfium2（可选，见 TODO-DL-4），
+# 缺失时回退 PyMuPDF；两者都没有时 PDF 页面无法渲染、无法识别 —— 服务器部署必须装其中一个。
+PyMuPDF>=1.24
