@@ -69,7 +69,7 @@ sudo -E PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple bash deploy/insta
 
 ## 2. 访问方式
 
-**推荐：SSH 隧道（默认，无需证书、不暴露端口）**
+### 方式一：SSH 隧道（最快，不暴露端口，适合自己用）
 
 ```powershell
 # 在你自己的电脑上执行（Windows PowerShell 同样可用）
@@ -77,8 +77,55 @@ ssh -N -L 9765:127.0.0.1:9765 forensic@<服务器IP>
 # 然后浏览器打开  http://127.0.0.1:9765/
 ```
 
-**可选：公网访问** —— 见 `deploy/nginx-basic-auth.conf`（Nginx + TLS + Basic Auth + `noindex`），
-需要域名与证书；服务器上 80/443 若已被其他 nginx 站点占用，请只新增一个站点，不要改动既有配置。
+缺点是**必须有一台电脑开着隧道**；服务本身仍在服务器上跑（systemd 托管），隧道只是访问通道。
+
+### 方式二：服务器常驻可访问（子域名 + HTTPS，推荐长期使用）
+
+适合「服务在 VPS 上、任何设备打开网址就能用」的场景。三步：
+
+```bash
+# 1) 让应用监听 0.0.0.0（同机 nginx 容器才访问得到），并开启 HTTP Basic 鉴权
+sudo bash /opt/forensic-doc-agent/deploy/install.sh \
+     --bind 0.0.0.0 --basic-auth 'forensic:<自己设一个强口令>' --no-seed
+
+# 2) 查 nginx 容器的 docker 网桥网关（容器访问宿主机走网关，不是 127.0.0.1）
+docker inspect nginx --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}'
+
+# 3) 新增一个站点（不要改动既有站点的配置文件）
+sudo cp /opt/forensic-doc-agent/deploy/nginx-forensic-doc-agent.conf \
+        /opt/proxy/nginx/conf.d/forensic-doc-agent.conf
+sudo sed -i 's/forensic.example.com/<你的子域名>/g; s#172.19.0.1#<上一步的网关>#' \
+        /opt/proxy/nginx/conf.d/forensic-doc-agent.conf
+docker exec nginx nginx -t && docker exec nginx nginx -s reload   # reload 是平滑的
+```
+
+`deploy/nginx-forensic-doc-agent.conf` 里已经包含：80→301、TLS、`noindex`、
+`client_max_body_size 64m`、`proxy_read_timeout 300s`（导出 PDF 慢）、以及把
+`Authorization` 头透传给应用层 Basic Auth。
+
+**然后加一条 DNS 记录**（这一步只能你自己做）：
+
+| 类型 | 名称 | 值 | 说明 |
+| --- | --- | --- | --- |
+| A | `forensic`（子域名前缀） | 服务器公网 IP | Cloudflare 可开代理（橙云）；源站证书用 Origin CA 通配证书即可 |
+
+**安全组/防火墙**：只需放行 `80`/`443`。**不要把 9765 对公网放行**——应用层 Basic Auth 只是兜底，
+真正的边界是「9765 不对外」。
+
+验证：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://<子域名>/api/health          # 期望 200（免鉴权）
+curl -s -o /dev/null -w '%{http_code}\n' https://<子域名>/api/config          # 期望 401（需凭据）
+curl -s -o /dev/null -w '%{http_code}\n' -u forensic:<口令> https://<子域名>/  # 期望 200
+```
+
+改口令/换监听地址：重跑第 1 步（`install.sh` 幂等，会重写 systemd 单元并重启服务）。
+
+### 方式三（不推荐）：直接把端口暴露到公网
+
+在云控制台安全组放行 `9765` 即可用 `http://<公网IP>:9765/` 访问，但**没有 TLS**（凭据与案件数据明文传输），
+仅适合临时验证，用完请立即关闭端口。
 
 ## 3. 运维
 

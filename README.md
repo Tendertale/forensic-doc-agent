@@ -79,6 +79,7 @@ Vue 开发模式：先启动后端，再 `cd frontend; npm run dev`（<http://12
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容接口地址 |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 默认模型 |
 | `LIBREOFFICE_BIN` | 自动探测 | LibreOffice 可执行文件路径 |
+| `FORENSIC_BASIC_AUTH` | 空（不启用） | 形如 `用户名:口令`；设置后全站要求 HTTP Basic 凭据（`/api/health` 免校验）。对外暴露前必须设置，详见 [`docs/DEPLOY.md`](docs/DEPLOY.md) |
 
 模型密钥只在当前页面内存中保存，通过 `X-DeepSeek-API-Key` 请求头传给后端；
 **不写入数据库、日志、源码、浏览器持久存储或构建产物**。

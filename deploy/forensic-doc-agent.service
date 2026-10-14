@@ -17,9 +17,11 @@ Environment=FORENSIC_DB_PATH=@DATA_DIR@/cases.db
 Environment=FORENSIC_STORAGE_ROOT=@DATA_DIR@/storage
 Environment=HOME=@DATA_DIR@/home
 Environment=PYTHONUNBUFFERED=1
+# 可选访问控制：留空=不启用鉴权（仅限本机/隧道）；形如 user:password 时全站要求 HTTP Basic 凭据
+Environment=FORENSIC_BASIC_AUTH=@BASIC_AUTH@
 
-# 只监听回环：对外访问走 SSH 隧道或 Nginx 反代（应用自身没有鉴权）
-ExecStart=@APP_DIR@/.venv/bin/python -m backend.scripts.serve --host 127.0.0.1 --port @PORT@ --no-seed
+# @BIND@ = 127.0.0.1（默认，最安全）或 0.0.0.0（需要被同机 nginx 容器反代时）
+ExecStart=@APP_DIR@/.venv/bin/python -m backend.scripts.serve --host @BIND@ --port @PORT@ --no-seed
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20

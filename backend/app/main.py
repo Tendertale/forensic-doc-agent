@@ -16,13 +16,15 @@
 
 from __future__ import annotations
 
+import base64
 import os
+import secrets
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .constants import SEED_CASE_COUNT
@@ -39,6 +41,23 @@ DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 
 #: 默认数据库路径（可由 `FORENSIC_DB_PATH` 覆盖）。
 DEFAULT_DB_PATH = "data/cases.db"
+
+#: 可选的访问控制：`FORENSIC_BASIC_AUTH="用户名:口令"`。
+#: 未设置时**不启用**任何鉴权（本机开发/隧道场景）；设置后除 `/api/health` 与 CORS 预检外，
+#: 所有请求都必须带正确的 HTTP Basic 凭据。司法鉴定材料对外暴露前必须设置它。
+BASIC_AUTH_ENV = "FORENSIC_BASIC_AUTH"
+
+
+def basic_auth_credentials() -> Optional[tuple[str, str]]:
+    """读取访问凭据；未配置或格式不合法时返回 None（表示不启用鉴权）。"""
+
+    raw = str(os.environ.get(BASIC_AUTH_ENV) or "").strip()
+    if not raw or ":" not in raw:
+        return None
+    user, _, password = raw.partition(":")
+    if not user or not password:
+        return None
+    return user, password
 
 _FALLBACK_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>法医尸表检验文书整理 Agent</title></head>
@@ -78,6 +97,32 @@ def create_app(db_path: Optional[str] = None, storage_root: Optional[str] = None
     app.state.storage_root = resolved_storage
 
     install_error_handlers(app)
+
+    # 可选访问控制（部署到服务器时可开启；本机默认关闭）
+    @app.middleware("http")
+    async def _basic_auth_guard(request, call_next):  # pragma: no cover - 由 test_basic_auth 覆盖
+        credentials = basic_auth_credentials()
+        path = request.url.path
+        # 健康检查与 CORS 预检不校验（预检请求不携带 Authorization，否则浏览器跨域会失败）
+        if credentials is None or path == "/api/health" or request.method == "OPTIONS":
+            return await call_next(request)
+
+        header = request.headers.get("authorization", "")
+        if header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
+            except Exception:  # noqa: BLE001 - 任意损坏的凭据都按未认证处理
+                decoded = ""
+            user, _, password = decoded.partition(":")
+            if (secrets.compare_digest(user, credentials[0])
+                    and secrets.compare_digest(password, credentials[1])):
+                return await call_next(request)
+
+        return JSONResponse(
+            {"detail": "需要访问凭据（HTTP Basic Auth）：本服务默认不对外公开，请使用配置的账号密码。"},
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="forensic-doc-agent", charset="UTF-8"'},
+        )
     app.include_router(router)
 
     app.add_middleware(

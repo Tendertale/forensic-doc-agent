@@ -175,6 +175,11 @@ storage/
   实现方式：`database._claim(case_id, expected_version)`；规则类端点用
   `_claim_rule(rule_id, expected_version)`。
 - 错误体：`{"detail": "<中文可读信息>"}`。
+- **可选访问控制（部署用）**：环境变量 `FORENSIC_BASIC_AUTH="用户名:口令"` 非空时启用 HTTP Basic 鉴权——
+  除 `GET /api/health`（探活，只返回状态，不含案件数据）与 CORS 预检 `OPTIONS` 外，所有请求必须携带
+  正确凭据，否则 `401` + `WWW-Authenticate: Basic realm="forensic-doc-agent", charset="UTF-8"`。
+  未设置或格式非法（缺用户名/口令）时不启用鉴权，适用于本机与 SSH 隧道场景。
+  **案件材料对外暴露前必须设置该变量**（应用自身没有账号体系；`expected_version` 只是乐观锁）。
 - 状态码：`400` 参数/前置条件不满足；`404` 资源不存在；`409` 版本冲突、非法状态流转、
   被阻断（`BlockedByChecklist`）、重复案件编号、OCR 引擎不可用；`422` Pydantic 校验失败；
   `502` 模型服务错误；`504` 模型超时。

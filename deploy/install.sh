@@ -17,6 +17,8 @@ APP_USER="forensic"
 APP_DIR="/opt/forensic-doc-agent"
 DATA_DIR="/var/lib/forensic-doc-agent"
 PORT="9765"
+BIND="127.0.0.1"
+BASIC_AUTH=""
 WITH_LIBREOFFICE=1
 WITH_SEED=1
 
@@ -27,9 +29,11 @@ while [[ $# -gt 0 ]]; do
     --data) DATA_DIR="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --repo) REPO_URL="$2"; shift 2 ;;
+    --bind) BIND="$2"; shift 2 ;;
+    --basic-auth) BASIC_AUTH="$2"; shift 2 ;;
     --no-libreoffice) WITH_LIBREOFFICE=0; shift ;;
     --no-seed) WITH_SEED=0; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
 done
@@ -87,6 +91,7 @@ echo "  $(sudo -u "$APP_USER" "$APP_DIR/.venv/bin/python" -V)"
 log "5/7 systemd 服务"
 sed -e "s#@APP_USER@#$APP_USER#g" -e "s#@APP_DIR@#$APP_DIR#g" \
     -e "s#@DATA_DIR@#$DATA_DIR#g" -e "s#@PORT@#$PORT#g" \
+    -e "s#@BIND@#$BIND#g" -e "s#@BASIC_AUTH@#$BASIC_AUTH#g" \
     "$APP_DIR/deploy/forensic-doc-agent.service" > /etc/systemd/system/forensic-doc-agent.service
 systemctl daemon-reload
 systemctl enable forensic-doc-agent >/dev/null
@@ -113,17 +118,18 @@ curl -fsS -o /dev/null -w "GET /  -> %{http_code}\n" "http://127.0.0.1:$PORT/"
 
 cat <<EOF
 
-部署完成。服务只监听 127.0.0.1:$PORT（应用自身没有登录，不要直接暴露公网）。
+部署完成。监听地址 $BIND:$PORT$([ -n "$BASIC_AUTH" ] && echo "（已启用 HTTP Basic 鉴权）" || echo "（未启用鉴权，请勿直接暴露公网）")。
 
-本机浏览器访问（SSH 隧道，把下面命令在你自己电脑上执行）：
+方式一（最快，无需公网）：SSH 隧道
   ssh -N -L $PORT:127.0.0.1:$PORT $APP_USER@<服务器IP>
   然后打开 http://127.0.0.1:$PORT/
+
+方式二（服务器常驻可访问，需 DNS + 反代）：见 docs/DEPLOY.md 第 2 节
+  重新部署时带上： --bind 0.0.0.0 --basic-auth '<用户名>:<口令>'
 
 常用运维命令：
   systemctl status|restart|stop forensic-doc-agent
   journalctl -u forensic-doc-agent -f
   升级： sudo bash $APP_DIR/deploy/install.sh --no-seed
   数据： SQLite + 案件附件都在 $DATA_DIR（备份这一目录即可）
-
-需要公网访问时见 docs/DEPLOY.md（Nginx + TLS + Basic Auth）。
 EOF
