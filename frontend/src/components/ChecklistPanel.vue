@@ -112,6 +112,15 @@ function sourceText(item) {
   if (source.injury_id) parts.push(`损伤 #${source.injury_id}`)
   if (source.document_id) parts.push(`文稿 #${source.document_id}`)
   if (source.code) parts.push(`代码 ${source.code}`)
+  // 照片栏位类校核项（PHOTO_SLOT_EMPTY / PHOTO_POSITION_MISSING）的来源字段
+  if (source.position_label || source.position_key) {
+    const count = source.assigned_count === undefined || source.assigned_count === null
+      ? ''
+      : `，已指派 ${source.assigned_count} 张`
+    parts.push(
+      `栏位 ${source.position_label || ''}${source.position_key ? `（${source.position_key}）` : ''}${count}`,
+    )
+  }
   if (Array.isArray(source.conflict) && source.conflict.length) {
     parts.push(`冲突来源 ${source.conflict.length} 条`)
   }

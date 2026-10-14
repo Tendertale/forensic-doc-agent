@@ -17,6 +17,39 @@ function num(...keys) {
   return 0
 }
 
+/** 该键在响应里是否存在（用于区分“真的是 0”与“接口没报告”）。 */
+function has(key) {
+  const value = props.stats?.[key]
+  return value !== undefined && value !== null
+}
+
+/**
+ * 材料总数：`GET /api/stats` 实测返回的是 **`material_counts` 对象**
+ * （{kind: count}，覆盖全部 MATERIAL_KINDS 并补 0），以及 `by_material_kind` 数组；
+ * 两者都没有 `materials` / `material_count` 这两个键——此前按后者取值，材料总数恒显示 0。
+ * 这里按真实响应求和，并在缺键时才回退旧的键名。
+ */
+const materialTotal = computed(() => {
+  const counts = props.stats?.material_counts
+  if (counts && typeof counts === 'object' && !Array.isArray(counts)) {
+    return Object.values(counts).reduce((sum, value) => sum + (Number(value) || 0), 0)
+  }
+  const byKind = props.stats?.by_material_kind
+  if (Array.isArray(byKind) && byKind.length) {
+    return byKind.reduce((sum, item) => sum + (Number(item?.count) || 0), 0)
+  }
+  return num('materials', 'material_count')
+})
+
+/**
+ * 损伤条目：接口只报告 `unresolved_injury_count`（待核对损伤），**没有损伤总数**。
+ * 取不到时显示“未记录”，不把未知写成 0（N-5：空白不等于正常）。
+ */
+const injuryTotal = computed(() => {
+  if (has('injuries') || has('injury_count')) return num('injuries', 'injury_count')
+  return '未记录'
+})
+
 const cards = computed(() => [
   {
     key: 'cases',
@@ -53,18 +86,18 @@ const cards = computed(() => [
   {
     key: 'materials',
     label: '材料总数',
-    note: '原件只读保存',
+    note: '原件只读保存（/api/stats 的 material_counts）',
     icon: Layers,
     tone: 'bg-sky-50 text-sky-700',
-    value: num('materials', 'material_count'),
+    value: materialTotal.value,
   },
   {
     key: 'injuries',
     label: '损伤条目',
-    note: '逐条保存不合并',
+    note: '逐条保存不合并；接口未报告总数时显示“未记录”',
     icon: Ruler,
     tone: 'bg-slate-100 text-slate-700',
-    value: num('injuries', 'injury_count'),
+    value: injuryTotal.value,
   },
 ])
 

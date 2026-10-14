@@ -441,3 +441,270 @@ def test_quick_run_duplicate_case_no_is_409(client):
     again = client.post("/api/quick-run", json=body)
     assert again.status_code == 409, again.text
     assert "已存在" in again.json()["detail"]
+
+
+# ==========================================================================
+# 四、照片栏位兜底（R-56 / N-8 / N-11 / N-12）：模板没有 `{{ photo_* }}` 锚点时
+#
+# **设计选择（语义冻结，二选一中的“自动追加为默认行为”）：**
+# `docgen.render_document` 在**工作副本**里没有任何 `{{ photo_` 锚点、而上下文里确有
+# “已指派位置”的照片时，自动向工作副本追加标准「部位照片」区（18 个栏位）后再渲染，
+# 模板原件一个字节都不改（N-8）。追加成功后照片必然进入文稿，因此 `checker` 的
+# `PHOTO_SLOT_MISSING` **不再产出**；只有当照片确实无处安放（生成失败 / 追加异常 /
+# 模板与输出同一路径 / 模板只声明了别的栏位）时，该 code 才会如实产出 warning。
+# ==========================================================================
+
+
+def template_without_photo_anchors_bytes() -> bytes:
+    """现场生成一份**完全没有**照片栏位锚点的自建模板（只有两个标量锚点）。"""
+
+    from docx import Document
+
+    document = Document()
+    document.add_paragraph("案件编号：{{ case_no }}")
+    document.add_paragraph("被检验对象：{{ subject_name }}")
+    document.add_paragraph("（本模板由用例程序化生成：没有任何部位照片栏位声明）")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def _photo_materials_of(db, case_id: int) -> List[Dict[str, Any]]:
+    return [item for item in db.list_materials(case_id) if item["kind"] == "photo"]
+
+
+def test_quick_run_appends_standard_photo_section_when_template_has_no_anchor(
+        client, db, storage):
+    """R-56 / N-8 / N-12：无锚点自建模板 + 1 张已指派照片 → 照片不再被静默丢弃。
+
+    断言（含两种设计中的“自动追加为默认行为”这一支的语义）：
+
+    * 200，生成的 `.docx` 恰有 1 张图片（修复前 `inline_shapes == 0`）；
+    * 正文含 18 个照片栏位标题行与 17 处「（未提供照片）」占位（有照片的栏位是图片）；
+    * `notes` 里有明确的追加说明；模板原件**逐字节未改动**；
+    * 校核清单里**不再**出现 `PHOTO_SLOT_MISSING`（追加后照片确实进了文稿）；
+    * 照片 `ocr_blocks == 0`（N-11）。
+    """
+
+    import hashlib
+
+    from backend.app.constants import PHOTO_POSITION_KEYS, PHOTO_PLACEHOLDER_TEXT
+
+    case_no = "FY-2026-9101"
+    template_bytes = template_without_photo_anchors_bytes()
+    body = {
+        "files": [
+            {"filename": "自建模板.docx", "media_type": "docx",
+             "content_base64": b64(template_bytes)},
+            {"filename": "左小腿.jpg", "media_type": "jpeg",
+             "content_base64": b64(jpeg_bytes(color=(198, 188, 176)))},
+        ],
+        "formats": ["docx"],
+        "case_no": case_no,
+    }
+    response = client.post("/api/quick-run", json=body)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    case_id = int(data["case_id"])
+
+    # ① 归类：第一份 Word 文档按模板处理；照片按文件名推断到 leg_left
+    assert [item["kind"] for item in data["assignments"]] == ["template", "photo"]
+    assert data["assignments"][1]["position_key"] == "leg_left"
+
+    # ② 生成结果：1 张照片进了文稿（修复前这里是 0），且标准照片区被追加
+    entry = data["documents"][0]
+    document = db.get_document(int(entry["id"]))
+    docx_path = storage.absolute(document["docx_path"])
+    assert docx_path.is_file()
+    assert inline_shape_count(docx_path) == 1, "照片必须按栏位插入文稿（R-56）"
+
+    text = docgen.extract_document_text(str(docx_path))
+    assert "{{" not in text and "}}" not in text and "{%" not in text
+    assert "未见异常" not in text  # N-5/N-12：空白绝不写成“未见异常”
+    assert text.count("照片栏位：") == len(PHOTO_POSITION_KEYS) == 18
+    assert text.count(PHOTO_PLACEHOLDER_TEXT) == len(PHOTO_POSITION_KEYS) - 1
+    assert "部位照片" in text
+    assert "照片栏位：左下肢" in text  # 有照片的栏位：图片插在该标题之后
+
+    # ③ notes 必须明确说明“系统追加了标准照片栏位”（R-59～R-63：绝不静默）
+    assert any("模板未声明照片栏位" in note and "追加" in note for note in data["notes"]), \
+        data["notes"]
+    assert any("N-8" in note for note in data["notes"]), data["notes"]
+
+    # ④ N-8：模板原件逐字节未改动（sha256 与字节双重比对）
+    template = [item for item in db.list_materials(case_id) if item["kind"] == "template"][0]
+    template_path = storage.absolute(template["original_path"])
+    assert template_path.read_bytes() == template_bytes
+    assert hashlib.sha256(template_path.read_bytes()).hexdigest() == template["sha256"]
+    assert hashlib.sha256(template_path.read_bytes()).hexdigest() == \
+        hashlib.sha256(template_bytes).hexdigest()
+
+    # ⑤ 追加成功后校核清单不再报 `PHOTO_SLOT_MISSING`（语义见模块级注释与本用例 docstring）
+    codes = {item["code"] for item in db.list_checklist(case_id)}
+    assert "PHOTO_SLOT_MISSING" not in codes, sorted(codes)
+
+    # ⑥ N-11：照片不产生任何识别块，仍被记录为“已跳过”
+    photos = _photo_materials_of(db, case_id)
+    assert len(photos) == 1
+    assert db.list_ocr_blocks(case_id, int(photos[0]["id"]))["items"] == []
+
+
+def test_photo_section_append_is_idempotent_and_never_touches_the_template(tmp_path):
+    """N-8 / 幂等：同一模板连续渲染两次都只插 1 张照片、只追加一次标准照片区。
+
+    直接走 `docgen.render_document`：`RenderResult.notes` 每次都说明“已追加”，而模板
+    原件字节两次渲染后完全一致（追加只发生在渲染用的工作副本上）。
+    """
+
+    template = tmp_path / "自建模板.docx"
+    template.write_bytes(template_without_photo_anchors_bytes())
+    before = template.read_bytes()
+
+    photo = tmp_path / "左小腿.jpg"
+    photo.write_bytes(jpeg_bytes(color=(201, 191, 179)))
+
+    context = {
+        "case_no": "FY-2026-9199",
+        "subject_name": "测试对象",
+        "photo_slots": {"leg_left": {"position_key": "leg_left", "label": "左下肢",
+                                     "photos": [{"path": str(photo), "material_id": 1}]}},
+    }
+
+    first = docgen.render_document(str(template), context, tmp_path / "out1.docx")
+    second = docgen.render_document(str(template), context, tmp_path / "out2.docx")
+
+    assert template.read_bytes() == before, "模板原件绝不能被改动（N-8）"
+    for result in (first, second):
+        assert result.notes and any("追加" in note for note in result.notes), result.notes
+        assert result.unresolved == []
+        assert inline_shape_count(result.output_path) == 1
+        text = docgen.extract_document_text(result.output_path)
+        # 只追加一次：18 个栏位标题，而不是 36 个（幂等）
+        assert text.count("照片栏位：") == 18
+        # 标准照片区标题行只出现一次（模板正文里也可能出现「部位照片」字样，故按整行计数）
+        assert [line.strip() for line in text.splitlines()].count("部位照片") == 1
+
+
+def test_template_with_declared_slot_is_not_appended_again(client, db, storage):
+    """幂等 / N-12：模板自己声明了照片栏位时，绝不追加标准照片区、也不重复插照片。"""
+
+    case_no = "FY-2026-9102"
+    response = client.post("/api/quick-run", json={
+        "files": [
+            {"filename": "有栏位模板.docx", "media_type": "docx",
+             "content_base64": b64(minimal_template_bytes())},
+            {"filename": "左小腿.jpg", "media_type": "jpeg",
+             "content_base64": b64(jpeg_bytes(color=(205, 195, 185)))},
+        ],
+        "formats": ["docx"],
+        "case_no": case_no,
+    })
+    assert response.status_code == 200, response.text
+    data = response.json()
+
+    document = db.get_document(int(data["documents"][0]["id"]))
+    docx_path = storage.absolute(document["docx_path"])
+    assert inline_shape_count(docx_path) == 1
+    text = docgen.extract_document_text(str(docx_path))
+    # 模板已有 `{{ photo_leg_left }}`：没有追加任何标准照片区
+    assert "照片栏位：" not in text
+    assert "部位照片" not in text
+    assert not any("追加" in note for note in data["notes"]), data["notes"]
+    codes = {item["code"] for item in db.list_checklist(int(data["case_id"]))}
+    assert "PHOTO_SLOT_MISSING" not in codes, sorted(codes)
+
+
+def test_quick_run_reports_photo_not_inserted_when_append_fails(client, db, storage,
+                                                                monkeypatch):
+    """R-63 / N-8：自动追加失败时**不静默**——`notes` 写明“照片未插入文稿”，校核也如实报。
+
+    这里把 `docgen.append_photo_section` 打成必然抛异常：渲染照常完成（不抛 500），
+    生成的文稿里没有栏位、也没有照片，说明与校核项都必须如实反映这一点。
+    """
+
+    from backend.app.constants import PHOTO_POSITION_KEYS  # noqa: F401  （说明栏位口径）
+
+    def _boom(document, keys=None):  # noqa: ANN001 - 模拟追加失败
+        raise RuntimeError("模拟追加失败：磁盘不可写")
+
+    monkeypatch.setattr(docgen, "append_photo_section", _boom)
+
+    case_no = "FY-2026-9103"
+    template_bytes = template_without_photo_anchors_bytes()
+    response = client.post("/api/quick-run", json={
+        "files": [
+            {"filename": "自建模板.docx", "media_type": "docx",
+             "content_base64": b64(template_bytes)},
+            {"filename": "左小腿.jpg", "media_type": "jpeg",
+             "content_base64": b64(jpeg_bytes(color=(190, 200, 205)))},
+        ],
+        "formats": ["docx"],
+        "case_no": case_no,
+    })
+    assert response.status_code == 200, response.text
+    data = response.json()
+    case_id = int(data["case_id"])
+
+    # 生成步骤本身仍然成功（追加失败不得让整条链路失败），但照片确实没进去
+    steps = {step["step"]: step for step in data["steps"]}
+    assert steps["render"]["ok"] is True, steps["render"]
+    document = db.get_document(int(data["documents"][0]["id"]))
+    docx_path = storage.absolute(document["docx_path"])
+    assert inline_shape_count(docx_path) == 0
+
+    # notes 如实写明，而不是静默丢弃
+    assert any("照片未插入文稿" in note for note in data["notes"]), data["notes"]
+
+    # 校核：照片无法进入文稿 → `PHOTO_SLOT_MISSING`（format/warning）
+    items = [item for item in db.list_checklist(case_id)
+             if item["code"] == "PHOTO_SLOT_MISSING"]
+    assert items, "照片无处安放时必须产出 PHOTO_SLOT_MISSING"
+    assert items[0]["category"] == "format" and items[0]["severity"] == "warning"
+    assert items[0]["target_type"] == "photo_slot"
+
+    # N-8：即便追加失败，模板原件也没有被改动
+    template = [item for item in db.list_materials(case_id) if item["kind"] == "template"][0]
+    assert storage.absolute(template["original_path"]).read_bytes() == template_bytes
+
+
+def test_photo_slot_missing_code_is_distinct_from_photo_slot_empty(tmp_path):
+    """§5.7：`PHOTO_SLOT_MISSING`（format/warning）与 `PHOTO_SLOT_EMPTY`（format/info）分界。
+
+    * 有已指派位置的照片 + 模板/文稿里都没有该栏位 → `PHOTO_SLOT_MISSING`；
+    * 模板声明了栏位（锚点或文稿标题行） → 不产出该 code（由 `PHOTO_SLOT_EMPTY` 负责空栏位）。
+    """
+
+    from backend.app.checker import check_case
+
+    photo_path = tmp_path / "左小腿.jpg"
+    photo_path.write_bytes(jpeg_bytes(color=(210, 200, 190)))
+    base = {
+        "materials": [{"id": 7, "kind": "photo", "filename": "左小腿.jpg",
+                       "position_key": "leg_left"}],
+        "photo_slots": [{"position_key": "leg_left", "label": "左下肢", "photos": [
+            {"material_id": 7, "path": str(photo_path), "filename": "左小腿.jpg",
+             "sort_order": 1}]}],
+    }
+
+    # ① 模板没有锚点、文稿里也没有该栏位 → 产出（warning，指向 photo_slot）
+    items = check_case(dict(base), template_text="案件编号：{{ case_no }}",
+                       stored_text="案件编号：FY-2026-9104")
+    hits = [item for item in items if item.code == "PHOTO_SLOT_MISSING"]
+    assert len(hits) == 1
+    assert (hits[0].category, hits[0].severity) == ("format", "warning")
+    assert hits[0].target_type == "photo_slot"
+    assert "{{ photo_leg_left }}" in hits[0].detail
+    assert "不会被插入文稿" in hits[0].detail
+    assert hits[0].source["position_key"] == "leg_left"
+
+    # ② 模板声明了该栏位锚点 → 不产出
+    declared = check_case(dict(base), template_text="照片栏位：左下肢\n{{ photo_leg_left }}",
+                          stored_text="照片栏位：左下肢\n（未提供照片）")
+    assert "PHOTO_SLOT_MISSING" not in {item.code for item in declared}
+
+    # ③ 模板没有锚点，但渲染产物里确实有该栏位标题行（系统自动追加标准照片区）
+    #    → 不产出（照片已经进得去）；这也正是“追加为默认行为”的语义
+    appended = check_case(dict(base), template_text="案件编号：{{ case_no }}",
+                          stored_text="部位照片\n照片栏位：左下肢\n（图片）\n照片栏位：右上肢\n（未提供照片）")
+    assert "PHOTO_SLOT_MISSING" not in {item.code for item in appended}
+

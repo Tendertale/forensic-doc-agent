@@ -1155,6 +1155,13 @@ class Database:
             approved = int(connection.execute(
                 "SELECT COUNT(*) AS total FROM documents WHERE doc_status='approved'"
             ).fetchone()["total"])
+            # 三项总数（前端统计卡直接消费；此前只有"未处理"口径，导致卡片恒为 0）
+            field_count = int(connection.execute(
+                "SELECT COUNT(*) AS total FROM case_fields").fetchone()["total"])
+            injury_count = int(connection.execute(
+                "SELECT COUNT(*) AS total FROM case_injuries").fetchone()["total"])
+            material_count = int(connection.execute(
+                "SELECT COUNT(*) AS total FROM materials").fetchone()["total"])
 
         stage_counts = {item: 0 for item in CASE_STAGES}
         for row in stage_rows:
@@ -1182,6 +1189,10 @@ class Database:
             "blocking_count": blocking,
             "document_count": document_count,
             "approved_document_count": approved,
+            # 总数口径（统计卡用）；与 *_count 的"未处理"口径并存，含义见 docs/architecture.md §4
+            "material_count": material_count,
+            "field_count": field_count,
+            "injury_count": injury_count,
             "material_counts": material_counts,
             "by_material_kind": [
                 {"kind": key, "label": MATERIAL_KIND_LABELS.get(key, key), "count": material_counts[key]}

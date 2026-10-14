@@ -63,7 +63,7 @@ frontend/
 ├── src/
 │   ├── main.js, styles.css        [冻结]
 │   ├── api.js                     [冻结] 前端接口层
-│   └── App.vue, components/*.vue  Vue 3 源码（需 `npm install` 才能构建：TODO-DL-3）
+│   └── App.vue, components/*.vue  Vue 3 源码（可 `npm install && npm run build`，见 TODO-DL-3 状态更正）
 └── static/                        无构建依赖工作台，由 FastAPI 直接提供（**当前可实际运行的前端**）
     ├── index.html
     ├── workbench.js
@@ -188,7 +188,7 @@ storage/
 | --- | --- | --- | --- |
 | GET | `/api/health` | — | `{"status":"ok","service":"forensic-doc-agent"}` |
 | GET | `/api/config` | — | 字段目录、枚举字典、阶段顺序、引擎状态、LibreOffice 状态、`photo_positions`、`demo_data`、`todo_downloads`、**`reference_standards` + `standard_config_confirmed`（R-49：技术标准只作参考提示，采用与否由业务方确认；未确认前不得据标准生成任何内容）**。形状（实测，已冻结）：枚举一律为 `[{key,label}]` 数组；引擎状态在 `engines = {docx:{preferred,docxtpl_available,todo}, libreoffice, libreoffice_available, ocr:[{name,available,detail}]}`；`ocr_engines` 只是名字数组（**不要**用它判断可用性） |
-| GET | `/api/stats` | — | 案件数、各阶段数、待核对字段数、阻断项数、文稿数、按材料类型分布 |
+| GET | `/api/stats` | — | 案件数、各阶段数、待核对字段数、阻断项数、文稿数、按材料类型分布；**总数口径**另有 `material_count` / `field_count` / `injury_count`（统计卡直接消费，与“未处理”口径的 `unresolved_*` 并存） |
 | POST | `/api/ai/verify` | 头 `X-DeepSeek-API-Key` | 测试模型连通性（`llm.py`） |
 | GET | `/api/cases` | 查询参数 | 服务端分页/搜索/筛选 |
 | POST | `/api/cases` | `CaseCreate` | 建案，自动生成 `case_no`，返回完整案件 |
@@ -621,6 +621,7 @@ def has_blocking(items: Sequence[CheckItem]) -> bool: ...
 | `PHOTO_POSITION_MISSING` | content | warning | 存在未指定 `position_key` 的部位照片（R-57） |
 | `PHOTO_FILE_MISSING` | format | warning | 已指派位置的照片原件文件不存在，渲染时被跳过（N-12/R-56） |
 | `PHOTO_SLOT_EMPTY` | format | info | 模板含该照片栏位但本次没有照片（正文写入 `PHOTO_PLACEHOLDER_TEXT`，N-12） |
+| `PHOTO_SLOT_MISSING` | format | warning | **有已指派位置的照片，但文稿里根本没有该栏位**（模板未声明锚点且自动追加失败/未执行）→ 照片不会被插入文稿，必须显式暴露。判定依据：渲染/模板文本里是否存在「`照片栏位：<栏位名>`」标题行（`docgen.PHOTO_SLOT_TITLE_PREFIX` / `docgen.photo_slot_title()`，两侧改动需同步）。与 `PHOTO_SLOT_EMPTY`（栏位在、照片缺）严格分界；`render_document` 的自动追加成功时**不**产出本项 |
 
 `check_case` 去重规则：相同 `(code, target_type, target_id)` 只保留一条。
 `check_case` 返回顺序固定为 `recognition → content → source → format → correction`。
@@ -637,8 +638,12 @@ class RenderResult:
     unresolved: list[str]
     paragraph_count: int
     table_count: int
+    notes: list[str] = field(default_factory=list)   # 渲染说明（如"模板未声明照片栏位，已自动追加标准照片区"）
 
 def docx_engine_status() -> dict: ...     # {"preferred": "docxtpl"|"builtin", "docxtpl_available": bool, "todo": "TODO-DL-1"}
+def append_photo_section(document, keys: Any = None) -> int: ...   # 追加标准「部位照片」区（18 栏位），返回栏位数
+def photo_slot_title(key: str) -> str: ...                          # 栏位标题行（checker 依赖的文本约定）
+def template_photo_keys(text: str) -> list[str]: ...                # 模板文本里声明的照片 key（按出现顺序去重）
 def build_demo_template(path: str | Path, template_version: str = DEFAULT_TEMPLATE_VERSION) -> str: ...
 def build_context(case_data: Mapping[str, Any]) -> dict: ...
 def resolve_template(case_data: Mapping[str, Any], templates_dir: str | Path) -> str: ...
@@ -675,6 +680,10 @@ def document_filename(case_no: str, doc_type: str, version_no: int, fmt: str) ->
   宽度 = `min(栏位最大宽度, 原始宽度)`，保持纵横比，原图不裁切；每张图片之后可选一行说明
   （用户填写的 `photo_caption` 优先，其次栏位 label）。栏位无照片时写入 `PHOTO_PLACEHOLDER_TEXT`。
   **渲染器不检查、不分析图片像素内容**，只按文件路径插入。
+- **照片栏位兜底（R-56/R-59）**：工作副本里**没有任何** `{{ photo_` 锚点、而上下文里确有已指派位置的照片时，
+  `render_document` 先向**工作副本**追加标准「部位照片」区（18 个栏位，标题行 + 居中锚点段落），
+  再把该说明写入 `RenderResult.notes`；**模板原件与 `template_path` 指向的文件绝不改动**（N-8）。
+  追加失败不得中断渲染，但必须在 `notes` 写明「照片未插入文稿」，并由 `PHOTO_SLOT_MISSING`（format/warning）显式暴露。
 - **照片通路（冻结口径）**：`workflow` 负责把照片接进上下文——
   `case_data["photo_slots"] = database.list_photo_slots(case_id)`（**list**，`list_photo_slots()` 的原始输出），
   并为其中每个 photo 追加 `path`（**绝对路径**，由 `case_data["storage_root"]` 解析）；`database.list_photo_slots()`
@@ -903,7 +912,7 @@ App.vue
 | --- | --- | --- | --- |
 | TODO-DL-1 `docxtpl` | `docgen.render_document(..., engine="docxtpl")`、`docgen.docx_engine_status()` | `engine="builtin"`（python-docx + Jinja2），`auto` 自动回退 | `auto` 自动改用 docxtpl，`/api/config` 报告 `docxtpl_available: true` |
 | TODO-DL-2 `paddleocr` | `ocr/paddle.py::PaddleOcrEngine` | `sidecar` 引擎（离线 JSON） | `get_engine("paddle").available()` 为真，可识别真实扫描件 |
-| TODO-DL-3 npm 依赖 | `frontend/`（源码完整） | 后端 API 全可用；`frontend/dist` 缺失时 `/` 由 `frontend/static/**` 提供 | `npm run build` 后 `<http://127.0.0.1:9765>` 直接打开 Vue 版工作台 |
+| TODO-DL-3 npm 依赖 | `frontend/`（源码完整） | `frontend/dist` 缺失时 `/` 由 `frontend/static/**` 无构建工作台提供（VPS 当前形态）；**本机 npm install/build 已实测可用**（2026-10-14 更正：此前“无法安装”只是离线模式结论） | `npm run build` 后 `<http://127.0.0.1:9765>` 打开 Vue 版；两个前端 UX 必须一致，且 `test_guards.py::test_built_frontend_is_not_stale` 会阻止“改了源码没重建” |
 | TODO-DL-4 `pypdfium2` | `imaging.render_pdf_pages()` | 已安装的 `PyMuPDF`（`fitz`） | 优先使用 pypdfium2 |
 | TODO-DL-5 云端 OCR | `ocr/__init__.register_engine()` | 未注册 | 注册后可在 `resolve_engine` 中选用 |
 | TODO-DL-6 真实样本 | `seed.seed_demo_case()` | 内置演示案件 | 替换为真实样本与已审核文稿 |

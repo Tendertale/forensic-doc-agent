@@ -18,6 +18,14 @@
    记录的像素尺寸/DPI 用于排版算宽），**不检查、不分析、不推断图片像素内容**；栏位没有
    可用照片时保留栏位并写入 `PHOTO_PLACEHOLDER_TEXT`（“（未提供照片）”），绝不挪用其它
    栏位的照片、绝不写“未见异常”。
+7. **照片栏位兜底（默认行为，R-56 / N-8 / N-12）**：用户自建模板常常没有任何
+   `{{ photo_* }}` 锚点，此时照片过去会被**静默丢弃**（`inline_shapes = 0`、`notes` 里也
+   没有说明）。现在 `render_document` 先复制模板到**工作副本**，若副本里没有任何
+   `{{ photo_` 锚点、而 `context["photo_slots"]` / `context["photos"]` 里确实有“已指派
+   位置”的照片，就向**工作副本**追加标准「部位照片」区（18 个栏位，见
+   `append_photo_section`）再渲染；模板原件一个字节都不改（N-8）。追加发生、无法追加
+   （模板与输出同一路径）或追加失败时，都在 `RenderResult.notes` 里写明中文说明，
+   绝不静默。相应地，`checker.PHOTO_SLOT_MISSING` 只对“照片确实无处安放”的栏位产出。
 
 已知限制（本文件顶部注释即声明，勿在别处重复声明）
 --------------------------------------------------
@@ -77,6 +85,9 @@ __all__ = [
     "DocgenUnavailable",
     "RenderResult",
     "docx_engine_status",
+    "append_photo_section",
+    "photo_slot_title",
+    "template_photo_keys",
     "build_demo_template",
     "build_context",
     "resolve_template",
@@ -104,6 +115,10 @@ class RenderResult:
     unresolved: List[str] = field(default_factory=list)
     paragraph_count: int = 0
     table_count: int = 0
+    #: 渲染过程中的**中文说明**（如「模板未声明照片栏位，已按标准栏位追加照片区」）。
+    #: 默认空列表，向后兼容；调用方（`quick.run_quick_pipeline`）应原样透出给用户，
+    #: 让“系统做了什么”可见，而不是静默处理（R-59～R-63 主流程透明化）。
+    notes: List[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +159,20 @@ _PHOTO_ANCHOR_RE = re.compile(r"^\s*\{\{\s*photo_(?P<key>[A-Za-z_][A-Za-z0-9_]*)
 
 #: 段落内任意位置出现的照片栏位锚点（用于发现“未按约定独立成段”的锚点）。
 _PHOTO_ANCHOR_ANY_RE = re.compile(r"\{\{\s*photo_(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+
+#: 标准「部位照片」区的标题行（`append_photo_section` 写入）。
+#: checker 用它判断“栏位是否真的进入了文稿”——「照片栏位」这四个字是本模块与
+#: `checker.PHOTO_SLOT_MISSING` 之间的**唯一**文本约定，改动时必须同步。
+PHOTO_SECTION_HEADING = "部位照片"
+
+#: 标准区的栏位标题行前缀：`照片栏位：<中文栏位名>`（宽幅栏位追加“（宽幅）”）。
+PHOTO_SLOT_TITLE_PREFIX = "照片栏位："
+
+#: 标准区的说明行（N-11：明确系统不识别照片内容）。
+PHOTO_SECTION_NOTE = (
+    "（以下照片按送检时逐张指定的部位栏位插入；系统不识别、不描述照片内容，"
+    "也不对其运行文字识别。）"
+)
 
 #: 图片头部没有 DPI 记录时的缺省值（px → cm 换算用）。
 _DEFAULT_IMAGE_DPI = 96.0
@@ -318,6 +347,34 @@ def _photo_anchor_key(text: str) -> str:
 def _photo_anchor_keys(text: str) -> List[str]:
     """段落内出现的全部 `{{ photo_<key> }}`（不论位置与 key 是否在目录中）。"""
     return [match.group("key") for match in _PHOTO_ANCHOR_ANY_RE.finditer(text or "")]
+
+
+def template_photo_keys(text: str) -> List[str]:
+    """模板文本里**声明**的照片栏位 key：只认位置目录内的 key，按出现顺序去重。
+
+    供 `quick.run_quick_pipeline` 判断“模板是否自己声明了照片栏位”（从而决定要不要
+    说明系统追加了标准照片区）。只读文本，不打开任何图片（N-11）。
+    """
+    keys: List[str] = []
+    for key in _photo_anchor_keys(text):
+        if key in C.PHOTO_POSITION_INDEX and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _working_copy_photo_anchors(document: DocxDocument) -> List[str]:
+    """扫描**工作副本**里出现的全部 `{{ photo_* }}` 锚点（去重、保持顺序）。
+
+    刻意比 `_photo_anchor_key()` 宽松：只要副本里出现过任何 `{{ photo_` 锚点（哪怕
+    没有独立成段、或 key 不在位置目录中），就认为模板**自己**声明了照片区，不再追加
+    标准区——否则模板里已有的锚点会与追加的 18 个标准栏位重复。
+    """
+    found: List[str] = []
+    for paragraph in _iter_all_paragraphs(document):
+        for key in _photo_anchor_keys(_paragraph_text(paragraph)):
+            if key not in found:
+                found.append(key)
+    return found
 
 
 def _clear_run(run: Run) -> None:
@@ -932,6 +989,35 @@ def _photo_exists(path: str) -> bool:
         return False
 
 
+def _photo_slots_with_photos(context: Mapping[str, Any]) -> List[str]:
+    """上下文里**确实带照片行**、且 key 在位置目录内的栏位（保持目录/输入顺序）。
+
+    只看“有没有照片行”，不判断文件是否存在、更不读取图片内容（N-11）；`photo_slots`
+    缺失时退回 `context["photos"]` 的 `position_key`。目录外的 key 不计入：标准照片区
+    只有 18 个目录栏位，给目录外的 key 追加标准区解决不了任何问题（那种情形由
+    `PHOTO_POSITION_MISSING` 提示用户重新指派位置，见 checker）。
+    """
+    if not isinstance(context, Mapping):
+        return []
+    keys: List[str] = []
+    slots = context.get("photo_slots")
+    if isinstance(slots, Mapping):
+        for raw_key, raw_slot in slots.items():
+            key = _clean(raw_key)
+            if key and _photo_entries(_as_mapping(raw_slot)):
+                keys.append(key)
+    if not keys:
+        for raw in _sequence(context.get("photos")):
+            key = _clean(_as_mapping(raw).get("position_key"))
+            if key:
+                keys.append(key)
+    picked: List[str] = []
+    for key in keys:
+        if key in C.PHOTO_POSITION_INDEX and key not in picked:
+            picked.append(key)
+    return picked
+
+
 def _natural_width_cm(path: str) -> Optional[float]:
     """图片原始宽度（厘米）：只读图片头部记录的像素尺寸与 DPI。
 
@@ -1296,6 +1382,80 @@ def _set_cell_text(cell: Any, text: str, bold: bool = False) -> None:
     _apply_demo_font(run, size=_DEMO_TABLE_PT, bold=bold)
 
 
+# --------------------------------------------------------------------------
+# 九之一、标准「部位照片」区（演示模板与**兜底追加**共用同一段构造逻辑）
+#
+# 用户自建模板常常**没有任何** `{{ photo_<key> }}` 锚点：此时照片不会被渲染进文稿
+# （修复前是静默丢弃）。`render_document` 因此在**工作副本**上调用
+# `append_photo_section()` 追加标准照片区，再照常渲染；模板原件一个字节都不改（N-8）。
+# --------------------------------------------------------------------------
+
+
+def _photo_section_keys(keys: Any = None) -> List[str]:
+    """标准照片区要写入的栏位 key：缺省为位置目录的全部栏位；显式传入时按目录顺序取。
+
+    只接受 `constants.PHOTO_POSITION_INDEX` 内的 key：目录外的 key 写成的锚点渲染不了，
+    只会留下 `{{ photo_* }}` 残锚（DOCUMENT_UNRESOLVED_PLACEHOLDER，blocking），
+    因此这里直接过滤掉，绝不写入。
+    """
+    if keys is None:
+        return [key for key in C.PHOTO_POSITION_KEYS if key in C.PHOTO_POSITION_INDEX]
+    picked: List[str] = []
+    for item in _sequence(keys):
+        key = _clean(item)
+        if key in C.PHOTO_POSITION_INDEX and key not in picked:
+            picked.append(key)
+    ordered = [key for key in C.PHOTO_POSITION_KEYS if key in picked]
+    ordered.extend(key for key in picked if key not in ordered)
+    return ordered
+
+
+def photo_slot_title(key: str) -> str:
+    """照片栏位的中文标题行：`照片栏位：<栏位名>`（宽幅栏位追加“（宽幅）”）。
+
+    这是本模块与 `checker.PHOTO_SLOT_MISSING` 之间的**唯一**文本约定：checker 依据
+    渲染产物里是否存在该标题行，判断“栏位是否真的进入了文稿”。
+    """
+    label = C.PHOTO_POSITION_LABELS.get(key, key)
+    if getattr(C.PHOTO_POSITION_INDEX.get(key), "wide", False):
+        label = f"{label}（宽幅）"
+    return f"{PHOTO_SLOT_TITLE_PREFIX}{label}"
+
+
+def append_photo_section(document: DocxDocument, keys: Any = None) -> int:
+    """向 `document`（**工作副本**，绝非模板原件）追加标准「部位照片」区，返回栏位数。
+
+    写入内容与排版（沿用演示模板的样式，中文栏位标题 + 居中锚点段落）：
+
+    * 标题行 `部位照片`（14 磅加粗）；
+    * 说明行 `PHOTO_SECTION_NOTE`（说明系统不识别照片内容，N-11）；
+    * 每个栏位两段：`照片栏位：<中文栏位名>`（加粗）+ **居中**的 `{{ photo_<key> }}`
+      锚点段落；栏位没有可用照片时渲染器会把锚点段替换为
+      `PHOTO_PLACEHOLDER_TEXT`（“（未提供照片）”）并保留栏位（N-12）。
+
+    :param document: 已打开的 `python-docx` 文档对象（调用方负责加载与保存）。
+    :param keys: 要写入的栏位 key；缺省为该文档对象所对应的**全部**目录栏位（18 个）。
+                 目录外的 key 一律忽略（见 `_photo_section_keys`）。
+    :returns: 实际追加的栏位数（0 表示 `keys` 为空或全部不在目录内）。
+
+    调用方约定：只有在工作副本里**完全没有** `{{ photo_` 锚点时才能调用，否则会与模板
+    自带的栏位重复（`render_document` 用 `_working_copy_photo_anchors()` 保证幂等）。
+    """
+    picked = _photo_section_keys(keys)
+    if not picked:
+        return 0
+    _add_paragraph(document, PHOTO_SECTION_HEADING, size=14, bold=True)
+    _add_paragraph(document, PHOTO_SECTION_NOTE, size=_DEMO_TABLE_PT)
+    for key in picked:
+        # 栏位标题（中文）+ 居中锚点段落：本栏位没有照片时正文写“（未提供照片）”，
+        # 居中的占位文字与插图段落（渲染时同样居中）排版一致。
+        _add_paragraph(document, photo_slot_title(key), size=_DEMO_BODY_PT, bold=True)
+        _add_paragraph(
+            document, "{{ photo_%s }}" % key, align=WD_ALIGN_PARAGRAPH.CENTER
+        )
+    return len(picked)
+
+
 def build_demo_template(path: str | Path, template_version: str = C.DEFAULT_TEMPLATE_VERSION) -> str:
     """程序化生成演示模板并保存到 `path`，返回路径字符串。
 
@@ -1352,24 +1512,9 @@ def build_demo_template(path: str | Path, template_version: str = C.DEFAULT_TEMP
     # D7：`_DEMO_PHOTO_KEYS` 取自 `constants.PHOTO_POSITION_KEYS`（全部 18 个栏位），
     # 与 `GET /photo-slots` 的目录口径一致；本函数每次都用 Document() 新建文档并覆盖
     # 目标文件，因此可重复调用且不会重复插入（幂等）。
-    _add_paragraph(document, "部位照片", size=14, bold=True)
-    _add_paragraph(
-        document,
-        "（以下照片按送检时逐张指定的部位栏位插入；系统不识别、不描述照片内容，"
-        "也不对其运行文字识别。）",
-        size=_DEMO_TABLE_PT,
-    )
-    for key in _DEMO_PHOTO_KEYS:
-        definition = C.PHOTO_POSITION_INDEX.get(key)
-        label = C.PHOTO_POSITION_LABELS.get(key, key)
-        if getattr(definition, "wide", False):
-            label = f"{label}（宽幅）"
-        _add_paragraph(document, f"照片栏位：{label}", size=_DEMO_BODY_PT, bold=True)
-        # 锚点段落居中：本栏位没有照片时正文写占位文字“（未提供照片）”，
-        # 居中的占位文字与插图段落（渲染时同样居中）排版一致。
-        _add_paragraph(
-            document, "{{ photo_%s }}" % key, align=WD_ALIGN_PARAGRAPH.CENTER
-        )
+    # 段落构造与“用户模板没有锚点时向工作副本兜底追加”共用同一个函数
+    # （`append_photo_section`），保证两处的栏位标题、排版与占位口径完全一致。
+    append_photo_section(document, _DEMO_PHOTO_KEYS)
 
     # ---- 草稿提示（跨段落 {% if %}；R-46：校核信息与文书正文分开） --------
     # 校核清单只在「校核表 / 工作台」中查看，**不得**把识别候选与处理说明写进文书正文；
@@ -1965,6 +2110,73 @@ def _render_with_builtin(template_path: Path, context: Mapping[str, Any], output
         raise DocgenUnavailable(f"渲染结果保存失败 {str(output_path)!r}：{exc!r}") from exc
 
 
+def _same_file(left: Path, right: Path) -> bool:
+    """两个路径是否指向同一个文件（`resolve()` 失败时退回字符串比较）。"""
+    try:
+        return left.resolve() == right.resolve()
+    except Exception:
+        return str(left) == str(right)
+
+
+def _prepare_photo_section(
+    source: Path, target: Path, context: Mapping[str, Any], notes: List[str]
+) -> int:
+    """兜底：模板没有声明任何照片栏位而本次确实有照片时，向**工作副本**追加标准照片区。
+
+    行为与边界（语义必须与 `checker.PHOTO_SLOT_MISSING` 一致）：
+
+    * **默认行为**：只要工作副本里没有任何 `{{ photo_` 锚点，而上下文里确实有
+      “已指派位置（key 在位置目录内）”的照片，就追加标准「部位照片」区（18 个栏位）
+      并返回栏位数——照片因此**不会**被静默丢弃；
+    * 追加只作用于 `target`（模板的**工作副本**），`source` 指向的模板原件绝不写入（N-8）；
+    * 模板与输出是同一个文件时（调用方要求就地渲染）不追加：此时没有“副本”可写，
+      写入就等于改写模板原件；改为在 `notes` 里如实说明，并由校核项
+      `PHOTO_SLOT_MISSING` 提醒用户（绝不静默）；
+    * 追加本身失败（异常）时**不中断渲染**：恢复工作副本为模板原样，并在 `notes` 里
+      写明“照片未插入文稿”。
+    """
+    photo_keys = _photo_slots_with_photos(context)
+    if not photo_keys:
+        # 没有“已指派位置的照片”→ 没有必须插入的照片，不追加空栏位（避免无谓地改排版）。
+        return 0
+    if _same_file(source, target):
+        notes.append(
+            "模板与输出为同一路径，无法在不改动模板原件的前提下追加照片栏位（N-8）："
+            "已指派位置的照片未插入文稿；请把模板与输出分开，或在模板中加入 "
+            "{{ photo_<位置> }} 栏位"
+        )
+        return 0
+    try:
+        working = _load_document(target)
+        if _working_copy_photo_anchors(working):
+            # 模板自己声明了照片栏位：绝不重复追加（幂等）。
+            return 0
+        appended = append_photo_section(working)
+        if not appended:
+            return 0
+        working.save(str(target))
+    except Exception as exc:  # noqa: BLE001 - 追加失败不得让整个生成失败
+        notes.append(
+            "模板未声明照片栏位，自动追加标准「部位照片」区失败（{0}: {1}）："
+            "已指派位置的照片未插入文稿，请在模板中加入 {{{{ photo_<位置> }}}} 栏位".format(
+                type(exc).__name__, exc
+            )
+        )
+        try:
+            # 恢复工作副本为模板原样，保证后续渲染仍从完整副本开始（N-8：原件未被触碰）。
+            shutil.copyfile(str(source), str(target))
+        except Exception:  # noqa: BLE001 - 恢复失败时后续渲染会给出明确失败信息
+            pass
+        return 0
+    notes.append(
+        "模板未声明照片栏位（{{{{ photo_<位置> }}}}），已按标准栏位追加「{0}」区"
+        "（{1} 个栏位）后再渲染；模板原件未改动（N-8）".format(
+            PHOTO_SECTION_HEADING, appended
+        )
+    )
+    return appended
+
+
 def render_document(
     template_path: str | Path,
     context: Mapping[str, Any],
@@ -1976,7 +2188,13 @@ def render_document(
     - `auto`：能 import `docxtpl` 就用 `docxtpl`，否则 `builtin`。
     - `docxtpl`：未安装 → `DocgenUnavailable`（消息含 `TODO-DL-1`）。
     - `builtin`：python-docx + Jinja2 自实现渲染。
-    - **绝不修改模板原件（N-8）**：先复制模板到 `output_path`，再在副本上渲染。
+    - **绝不修改模板原件（N-8）**：先复制模板到 `output_path`，之后的一切读写（含照片区
+      兜底追加）都发生在**工作副本**上；模板原件只被读取。
+    - **照片栏位兜底（R-56 / N-12）**：工作副本里没有任何 `{{ photo_` 锚点、而
+      `context["photo_slots"]` / `context["photos"]` 里确实有“已指派位置”的照片时，
+      先向工作副本追加标准「部位照片」区（18 个栏位、中文栏位标题行、居中锚点段落）
+      再渲染，并把说明写进 `RenderResult.notes`；追加失败或无法追加（模板与输出同一
+      路径）时同样写进 `notes` 如实说明“照片未插入文稿”，绝不静默丢弃。
     """
     source = Path(template_path)
     target = Path(output_path)
@@ -1995,19 +2213,24 @@ def render_document(
     if requested == "auto":
         selected = ENGINE_DOCXTPL if docx_engine_status()["docxtpl_available"] else ENGINE_BUILTIN
 
+    notes: List[str] = []
+
     # N-8：先复制模板副本，之后所有写入都发生在副本上。
     try:
-        if source.resolve() != target.resolve():
+        if not _same_file(source, target):
             shutil.copyfile(str(source), str(target))
     except Exception as exc:
         raise DocgenUnavailable(
             f"复制模板到输出路径失败（{str(source)!r} → {str(target)!r}）：{exc!r}"
         ) from exc
 
+    # 照片栏位兜底：只改工作副本（target），模板原件（source）绝不写入。
+    _prepare_photo_section(source, target, context, notes)
+
     if selected == ENGINE_DOCXTPL:
-        _render_with_docxtpl(source, context, target)
+        _render_with_docxtpl(target, context, target)
     else:
-        _render_with_builtin(source, context, target)
+        _render_with_builtin(target, context, target)
 
     document = _load_document(target)
     unresolved = _collect_unresolved(document)
@@ -2017,6 +2240,7 @@ def render_document(
         unresolved=unresolved,
         paragraph_count=_count_paragraphs(document),
         table_count=_count_tables(document),
+        notes=notes,
     )
 
 

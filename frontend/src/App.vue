@@ -1,11 +1,12 @@
 <script setup>
 /**
- * 法医尸表检验文书整理 —— 前端根组件（W4 Vue 3 源码，未经构建验证，见 TODO-DL-3）。
+ * 法医尸表检验文书整理 —— 前端根组件（Vue 3 源码，已通过 `npm run build` 构建验证）。
  *
  * 职责：
  * 1. 拉取 /api/config 与 /api/stats，构建全局字典（阶段、状态、材料类型…）传给子组件；
- * 2. 案件列表的服务端分页/筛选与建案、删除；
- * 3. 打开案件工作台（四步主流程 R-1）；
+ * 2. 主流程（Transparent）：默认首屏是「整理」（QuickRun.vue：上传 → 一次 POST /api/quick-run → 结果），
+ *    普通用户只看到上传与结果；案件字段梳理退到次级界面「案件记录」；
+ * 3. 次级界面：案件列表、案件工作台（四步主流程 R-1）、复核中心、术语规则、系统配置；
  * 4. 全局 toast / 错误横幅，以及 409「已被其他操作更新，请刷新后重试」的统一处理。
  *
  * 组件间只通过 props / emits 通信；所有接口调用走 api.js。
@@ -15,6 +16,7 @@ import { CircleAlert, CircleCheck, CircleX, KeyRound, RefreshCw, Settings } from
 import { api } from './api.js'
 import Sidebar from './components/Sidebar.vue'
 import StatsCards from './components/StatsCards.vue'
+import QuickRun from './components/QuickRun.vue'
 import CaseTable from './components/CaseTable.vue'
 import CreateCaseModal from './components/CreateCaseModal.vue'
 import CaseWorkspace from './components/CaseWorkspace.vue'
@@ -97,8 +99,14 @@ const PHOTO_SECTION_KEYS = ['full', 'head', 'body', 'limb', 'other']
 /* ------------------------------------------------------------------ *
  * 全局状态
  * ------------------------------------------------------------------ */
-const activeView = ref('cases')
+// 默认首屏 = 主视图「整理」：普通用户只需要“上传 → 结果”（Transparent 主流程）。
+const activeView = ref('quick')
 const sidebarOpen = ref(false)
+
+// 主视图「整理」的实例：文件拖到页面任意位置都由它接管（与 static 版的文档级拖拽一致）。
+const quickRef = ref(null)
+// 「结果」导航徽标：尚未整理 / 待处理 N / 阻断 N / 已完成（对齐 static 版 renderResultsNavBadge）。
+const quickBadge = ref({ has: false, blocking: 0, unresolved: 0 })
 
 const config = ref({})
 const configLoaded = ref(false)
@@ -379,7 +387,54 @@ const sidebarCounts = computed(() => ({
   blocking: statNum('blocking_items', 'blocking_item_count', 'blocking_count', 'open_blocking'),
   unresolved: statNum('unresolved_fields', 'unresolved_field_count', 'pending_fields', 'unresolved_count'),
   rules: statNum('rules', 'rule_count', 'terminology_rules'),
+  resultsLabel: resultsLabel.value,
+  resultsTone: resultsTone.value,
 }))
+
+/** 「结果」导航徽标文案（对齐 static 版：阻断 N / 待处理 N / 已完成 / 尚未整理）。 */
+const resultsLabel = computed(() => {
+  const badge = quickBadge.value
+  if (!badge.has) return '尚未整理'
+  if (Number(badge.blocking) > 0) return `阻断 ${Number(badge.blocking)}`
+  if (Number(badge.unresolved) > 0) return `待处理 ${Number(badge.unresolved)}`
+  return '已完成'
+})
+
+const resultsTone = computed(() => {
+  const badge = quickBadge.value
+  if (!badge.has) return 'muted'
+  if (Number(badge.blocking) > 0) return 'danger'
+  if (Number(badge.unresolved) > 0) return 'warning'
+  return 'ok'
+})
+
+/**
+ * 传给 StatsCards 的统计视图（实测修正）。
+ * `GET /api/stats` 实际键名：case_count/total_cases、document_count、unresolved_field_count、
+ * blocking_count、material_counts（对象）、by_material_kind（[{kind,label,count}]）。
+ * 而 StatsCards（主 Agent 冻结、前端只读）读的是 `materials|material_count`、`documents`、
+ * `unresolved_fields`、`blocking_items`。这里在 App.vue 侧补别名，卡片不再显示 0，
+ * 且不改动任何冻结文件。
+ */
+const statsView = computed(() => {
+  const raw = stats.value || {}
+  const kindRows = Array.isArray(raw.by_material_kind) ? raw.by_material_kind : []
+  const materialTotal = kindRows.reduce((sum, item) => sum + (Number(item && item.count) || 0), 0)
+  const view = { ...raw }
+  if (view.material_count === undefined && view.materials === undefined && materialTotal) {
+    view.material_count = materialTotal
+  }
+  if (view.documents === undefined && raw.document_count !== undefined) view.documents = raw.document_count
+  if (view.unresolved_fields === undefined && raw.unresolved_field_count !== undefined) {
+    view.unresolved_fields = raw.unresolved_field_count
+  }
+  if (view.blocking_items === undefined && raw.blocking_count !== undefined) {
+    view.blocking_items = raw.blocking_count
+  }
+  // 损伤总数：/api/stats 目前不提供（已作为契约缺口上报），后端补齐后自动透传
+  if (view.injuries === undefined && raw.injury_count !== undefined) view.injuries = raw.injury_count
+  return view
+})
 
 /**
  * 引擎状态行。/api/config 的 engines 实际形态：
@@ -544,6 +599,22 @@ async function refreshCase() {
  * 交互
  * ------------------------------------------------------------------ */
 function navigate(view) {
+  // 主流程（Transparent）：整理 / 结果，两页共用同一个 QuickRun 实例，文件与结果都不丢。
+  if (view === 'case') {
+    // 「案件工作台」= 四步核对：必须先在案件记录里选中案件。
+    if (selectedCase.value && selectedCase.value.id) {
+      sidebarOpen.value = false
+      activeView.value = 'case'
+      workspaceOpen.value = true
+      return
+    }
+    sidebarOpen.value = false
+    notify('请先在「案件记录」里打开一个案件，再进入四步核对工作台', 'info')
+    activeView.value = 'cases'
+    loadCases()
+    return
+  }
+
   activeView.value = view
   sidebarOpen.value = false
   if (view === 'review') {
@@ -552,6 +623,77 @@ function navigate(view) {
   } else if (view === 'cases') {
     loadCases()
   }
+}
+
+/** 主视图提交成功后的回调：只更新「结果」徽标（刷新由 @refresh 单独触发）。 */
+function onQuickResult(info) {
+  quickBadge.value = {
+    has: Boolean(info && info.has),
+    blocking: Number(info && info.blocking) || 0,
+    unresolved: Number(info && info.unresolved) || 0,
+  }
+}
+
+/** 整理成功或再整理一批后：刷新统计与案件列表（失败不影响结果页）。 */
+async function refreshAfterQuick() {
+  await Promise.all([loadCases(), loadStats()])
+}
+
+/** 结果页「查看案件记录 / 去案件记录修改」：打开该案件的案件工作台。 */
+async function openCaseFromResult(payload) {
+  const id = Number(payload && payload.id) || 0
+  if (!id) {
+    notify('缺少案件 ID：服务端响应里没有 case_id，无法打开案件记录', 'error')
+    return
+  }
+  closeWorkspace()
+  selectedCase.value = null
+  activeView.value = 'case'
+  workspaceOpen.value = true
+  const detail = await loadCaseDetail(id)
+  if (!detail) {
+    workspaceOpen.value = false
+    activeView.value = 'results'
+  }
+}
+
+/**
+ * 文档级拖拽兜底：drop 一律阻止浏览器直接打开文件（否则会丢当前页面状态），
+ * 拖到主视图拖拽区时交给 QuickRun 处理；落在别处只阻止默认行为。
+ */
+function dropZoneOf(event) {
+  const target = event.target
+  if (target && typeof target.closest === 'function') return target.closest('[data-dropzone]')
+  return null
+}
+
+function onDocumentDragEnter(event) {
+  const zone = dropZoneOf(event)
+  if (!zone) return
+  event.preventDefault()
+}
+
+function onDocumentDragOver(event) {
+  const zone = dropZoneOf(event)
+  if (!zone) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+}
+
+function onDocumentDrop(event) {
+  event.preventDefault()
+  if (!dropZoneOf(event)) return
+  const dropped = Array.from(event.dataTransfer?.files || [])
+  if (!dropped.length) {
+    notify('没有读到文件：如果是文件夹或浏览器不支持的类型，请改用“选择文件”按钮', 'error')
+    return
+  }
+  if (activeView.value !== 'quick') {
+    // 与 static 版一致：拖动文件到主界面时自动回到「整理」页。
+    activeView.value = 'quick'
+    sidebarOpen.value = false
+  }
+  quickRef.value?.addFiles(dropped)
 }
 
 function updateFilters(patch) {
@@ -624,11 +766,17 @@ async function verifyAi(key) {
 }
 
 onMounted(async () => {
+  document.addEventListener('dragenter', onDocumentDragEnter)
+  document.addEventListener('dragover', onDocumentDragOver)
+  document.addEventListener('drop', onDocumentDrop)
   await loadConfig()
   await Promise.all([loadCases(), loadStats()])
 })
 
 onUnmounted(() => {
+  document.removeEventListener('dragenter', onDocumentDragEnter)
+  document.removeEventListener('dragover', onDocumentDragOver)
+  document.removeEventListener('drop', onDocumentDrop)
   if (toastTimer) window.clearTimeout(toastTimer)
 })
 </script>
@@ -662,7 +810,7 @@ onUnmounted(() => {
               法医尸表检验文书整理工作台
             </h1>
             <p class="truncate text-xs text-gray-500">
-              四步主流程：选择材料 → 核对疑点 → 查看文档 → 确认修改（R-1）
+              主界面：上传 → 结果（一次点击拿到 Word / PDF）· 次级界面「案件记录」保留四步核对：选择材料 → 核对疑点 → 查看文档 → 确认修改（R-1）
             </p>
           </div>
           <button class="btn-secondary" :disabled="listLoading || statsLoading" @click="refreshAll">
@@ -708,9 +856,27 @@ onUnmounted(() => {
       </Transition>
 
       <main class="mx-auto max-w-[1600px] space-y-5 px-4 py-5 sm:px-6">
+        <!-- 主流程（Transparent）：整理 → 结果。
+             用 v-show 常驻而不是 v-if：在「整理」与「结果」之间来回切换、或去次级界面看案件，
+             已选文件、输出格式与上一次结果都不会丢；文档级拖拽也始终有落点。 -->
+        <div v-show="activeView === 'quick' || activeView === 'results'">
+          <QuickRun
+            ref="quickRef"
+            :view="activeView === 'results' ? 'results' : 'quick'"
+            :dict="dict"
+            :photo-groups="photoPositionGroups"
+            @navigate="navigate"
+            @open-case="openCaseFromResult"
+            @notify="notify"
+            @error="handleError"
+            @result="onQuickResult"
+            @refresh="refreshAfterQuick"
+          />
+        </div>
+
         <!-- 案件列表 -->
         <template v-if="activeView === 'cases'">
-          <StatsCards :stats="stats" :loading="statsLoading" :dict="dict" />
+          <StatsCards :stats="statsView" :loading="statsLoading" :dict="dict" />
           <CaseTable
             :items="casesPayload.items"
             :total="casesPayload.total"
@@ -765,7 +931,7 @@ onUnmounted(() => {
         </template>
 
         <!-- 系统配置 -->
-        <template v-else>
+        <template v-else-if="activeView === 'settings'">
           <section class="panel p-5">
             <h2 class="text-base font-semibold text-gray-950">系统配置</h2>
             <p class="mt-1 text-sm text-gray-600">
@@ -848,7 +1014,7 @@ onUnmounted(() => {
           <section class="panel p-5">
             <h2 class="text-base font-semibold text-gray-950">已知限制</h2>
             <ul class="mt-2 space-y-1 text-sm text-gray-700">
-              <li>TODO-DL-3：本机无 npm 依赖，Vue 3 源码未经 <code class="rounded bg-gray-100 px-1">npm install</code> / <code class="rounded bg-gray-100 px-1">npm run build</code> 验证；当前可运行前端为无构建工作台。</li>
+              <li>TODO-DL-3：本机 <code class="rounded bg-gray-100 px-1">npm install</code> / <code class="rounded bg-gray-100 px-1">npm run build</code> 已可用，Vue 3 源码已通过 <code class="rounded bg-gray-100 px-1">vite build</code> 构建验证（产物在 <code class="rounded bg-gray-100 px-1">frontend/dist</code>），并与无构建工作台 <code class="rounded bg-gray-100 px-1">frontend/static</code> 并存；浏览器内的真实拖拽与点击下载仍未自动化验证，需人工点一遍。</li>
               <li>TODO-DL-2：PaddleOCR 未安装时识别引擎不可用，接口会返回 409。</li>
               <li>TODO-DL-1 / TODO-DL-4：模板填充与 PDF 渲染自动回退，回退结果在此页面显式报告。</li>
             </ul>

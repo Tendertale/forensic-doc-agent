@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from backend.app.constants import (
     MATERIAL_KINDS,
     OCR_MATERIAL_KINDS,
@@ -27,15 +29,51 @@ STATIC_DIR = PROJECT_ROOT / "frontend" / "static"
 # --------------------------------------------------------------------------
 
 
-def test_r1_workbench_root_exposes_the_four_step_flow(client):
-    """R-1：`GET /` 返回的工作台暴露「选择材料 → 核对疑点 → 查看文档 → 确认修改」四步入口。"""
+def test_r1_frontend_exposes_primary_flow_and_four_step_entries(client):
+    """R-1（v2 修订）+ R-59：主界面＝「上传 → 结果」，四步入口保留在次级「案件记录」。
+
+    修订原因：用户要求主流程 Transparent（只看到上传与结果），四步核对退为次级界面。
+    因此这里不再要求「四步标签出现在 `GET /` 的 HTML 里」（那取决于挂载的是构建产物还是
+    无构建工作台），而是要求**随包发布的前端源码**里两种入口都存在。
+    """
 
     response = client.get("/")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
-    text = response.text
+
+    sources = [STATIC_DIR / "index.html", STATIC_DIR / "workbench.js"]
+    sources.extend(sorted((PROJECT_ROOT / "frontend" / "src").rglob("*.vue")))
+    joined = "\n".join(path.read_text(encoding="utf-8") for path in sources if path.is_file())
+
     for label in ("选择材料", "核对疑点", "查看文档", "确认修改"):
-        assert label in text, label
+        assert label in joined, "四步入口缺失：" + label
+    for label in ("整理", "上传", "结果"):
+        assert label in joined, "主流程入口缺失：" + label
+    assert "/api/quick-run" in joined or "quickRun" in joined
+
+
+def test_built_frontend_is_not_stale():
+    """若存在 `frontend/dist`，它必须不早于 `frontend/src/**` 与 `frontend/static/**`。
+
+    背景：`main.py` 在 `frontend/dist` 存在时优先在 `/` 提供该构建产物。曾真实发生
+    「改了源码没重新构建 → 用户看到的是旧界面」。这里让过期构建**显式失败**，
+    而不是静默服务旧界面。
+    """
+
+    dist_index = PROJECT_ROOT / "frontend" / "dist" / "index.html"
+    if not dist_index.is_file():
+        pytest.skip("未构建：/ 由 frontend/static 无构建工作台提供（当前 VPS 部署形态）")
+
+    newest = 0.0
+    for folder in (PROJECT_ROOT / "frontend" / "src", STATIC_DIR):
+        for path in folder.rglob("*"):
+            if path.is_file():
+                newest = max(newest, path.stat().st_mtime)
+
+    assert dist_index.stat().st_mtime >= newest - 1.0, (
+        "frontend/dist 早于前端源码：请重新执行 `cd frontend; npm run build`"
+        "（否则 / 会提供过期界面）"
+    )
 
 
 def test_r58_workbench_declares_photo_position_entry_and_no_reading_policy():

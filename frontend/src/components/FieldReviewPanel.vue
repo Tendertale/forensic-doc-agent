@@ -49,7 +49,7 @@ const busyKey = ref('')
 const filterStatus = ref('')
 const onlyPending = ref(false)
 const keyword = ref('')
-const preview = reactive({ open: false, materialId: 0, page: 1, filename: '' })
+const preview = reactive({ open: false, materialId: 0, page: 1, filename: '', label: '', bbox: [] })
 
 const materialNames = computed(() => {
   const map = {}
@@ -199,9 +199,36 @@ function sourceFileName(field) {
   return materialNames.value[field.source_material_id] || `材料 #${field.source_material_id}`
 }
 
+/**
+ * 原页位置（bbox）。后端与 sidecar 的坐标语义是 `[x0, y0, x1, y1]`、归一化到 0–1
+ * （sidecar 实测首块：{"text":"委托书","bbox":[0.08,0.06,0.3,0.11]}）。
+ * 按「左/上/右/下」显示到小数点后 3 位，避免四舍五入丢精度。
+ */
+function bboxParts(bbox) {
+  if (!Array.isArray(bbox) || bbox.length < 4) return null
+  const values = bbox.slice(0, 4).map((value) => Number(value))
+  if (values.some((value) => !Number.isFinite(value))) return null
+  const [x0, y0, x1, y1] = values
+  const valid = x1 > x0 && y1 > y0 && values.every((value) => value >= 0 && value <= 1)
+  return { x0, y0, x1, y1, valid }
+}
+
 function bboxText(bbox) {
-  if (!Array.isArray(bbox) || bbox.length < 4) return '未记录'
-  return bbox.map((value) => Number(value).toFixed(1)).join(', ')
+  const parts = bboxParts(bbox)
+  if (!parts) return '未记录'
+  return `左 ${parts.x0.toFixed(3)} · 上 ${parts.y0.toFixed(3)} · 右 ${parts.x1.toFixed(3)} · 下 ${parts.y1.toFixed(3)}（归一化 0–1）`
+}
+
+/** 在原图上叠加来源区域框（仅在坐标为 0–1 且右/下大于左/上时显示）。 */
+function bboxStyle(bbox) {
+  const parts = bboxParts(bbox)
+  if (!parts || !parts.valid) return null
+  return {
+    left: `${(parts.x0 * 100).toFixed(2)}%`,
+    top: `${(parts.y0 * 100).toFixed(2)}%`,
+    width: `${((parts.x1 - parts.x0) * 100).toFixed(2)}%`,
+    height: `${((parts.y1 - parts.y0) * 100).toFixed(2)}%`,
+  }
 }
 
 /** 识别结果：优先 recognized_value / ocr_text，退回原文；均空则「未记录」。 */
@@ -281,6 +308,8 @@ function openPreview(field) {
   preview.materialId = field.source_material_id
   preview.page = Number(field.source_page) || 1
   preview.filename = materialNames.value[field.source_material_id] || `材料 #${field.source_material_id}`
+  preview.label = String(field.field_label || field.field_key || '')
+  preview.bbox = Array.isArray(field.source_bbox) ? field.source_bbox.slice() : []
 }
 
 function closePreview() {
@@ -563,13 +592,31 @@ function useRecognized(field) {
             </button>
           </header>
           <div class="p-4">
-            <label class="mb-2 flex items-center gap-2 text-xs text-gray-500">
-              <span>页码</span>
-              <input v-model.number="preview.page" class="form-input w-20 py-1.5" type="number" min="1" />
-            </label>
-            <div class="overflow-hidden rounded-lg border border-gray-200 bg-gray-50">
-              <img :src="previewUrl()" :alt="`${preview.filename} 第 ${preview.page} 页`" class="mx-auto max-h-[70vh] w-auto" />
+            <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <label class="flex items-center gap-2 text-xs text-gray-500">
+                <span>页码</span>
+                <input v-model.number="preview.page" class="form-input w-20 py-1.5" type="number" min="1" />
+              </label>
+              <p v-if="preview.label" class="text-xs text-gray-500">
+                正在核对的字段：<span class="font-medium text-gray-800">{{ preview.label }}</span>
+              </p>
             </div>
+            <div class="relative overflow-hidden rounded-lg border border-gray-200 bg-gray-50">
+              <img :src="previewUrl()" :alt="`${preview.filename} 第 ${preview.page} 页`" class="mx-auto max-h-[70vh] w-auto" />
+              <span
+                v-if="bboxStyle(preview.bbox)"
+                class="pointer-events-none absolute border-2 border-red-500 bg-red-500/20"
+                :style="bboxStyle(preview.bbox)"
+              />
+            </div>
+            <p class="mt-2 text-xs text-gray-500">
+              <template v-if="bboxStyle(preview.bbox)">
+                红框为该字段在原件中的来源区域（bbox={{ preview.bbox.join(', ') }}，归一化 0–1，按原图比例换算）。
+              </template>
+              <template v-else>
+                该字段未记录可用的原页位置（bbox 未记录），请按原文与页码人工比对。
+              </template>
+            </p>
           </div>
         </div>
       </div>

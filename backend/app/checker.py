@@ -6,7 +6,8 @@
 契约约束
 --------
 * 类别取自 ``constants.CHECK_CATEGORIES``，级别取自 ``constants.CHECK_SEVERITIES``；
-* 23 个 ``code`` 是契约的一部分（测试与前端按 code 断言），不得增删改名；
+* 24 个 ``code`` 是契约的一部分（测试与前端按 code 断言），不得增删改名
+  （``PHOTO_SLOT_MISSING`` 为「照片栏位兜底」新增的第 24 个，见 §5.7 交付说明）；
 * 本模块**只报告，不修改**任何输入数据，也不写数据库。
 
 ``code`` ↔ 需求编号对照
@@ -38,6 +39,8 @@ format（格式质量）
   * ``DOCUMENT_TEXT_DIVERGED``        R-46/R-50：渲染文本与存储文本不一致。
   * ``PHOTO_FILE_MISSING``            R-56/N-12：已指派位置的照片原件文件不存在，渲染时被跳过。
   * ``PHOTO_SLOT_EMPTY``              N-12：模板声明了该照片栏位但本次没有照片（正文写占位文字）。
+  * ``PHOTO_SLOT_MISSING``            R-56/N-12：案件有已指派位置的照片，但模板没声明该栏位的
+    锚点、渲染产物里也没有该栏位 → 照片进不了文稿（提醒加 `{{ photo_<位置> }}` 或让系统自动追加）。
 
 correction（修改可靠性）
   * ``CORRECTION_UNAPPLIED``          R-38/R-40：修正未应用。
@@ -496,6 +499,53 @@ def _photo_slot_target_id(key: str) -> int:
     except (TypeError, ValueError):
         value = 0
     return value if value > 0 else 0
+
+
+#: 标准照片区的栏位标题行前缀（与 `docgen.PHOTO_SLOT_TITLE_PREFIX` 同一约定：
+#: 「照片栏位：<中文栏位名>」）。这是 `PHOTO_SLOT_MISSING` 判断“栏位是否真的进入了
+#: 文稿”的唯一文本依据，两个模块必须同步改动。
+_PHOTO_SLOT_TITLE_PREFIX = "照片栏位："
+
+
+def _photo_slot_title_texts(key: str, photos: Sequence[Mapping[str, Any]]) -> List[str]:
+    """该栏位在文稿正文里应当出现的标题行文本（可能有多种写法）。
+
+    优先取 `docgen.photo_slot_title()`（标准照片区与演示模板写入的唯一格式），
+    `docgen` 不可用时退回本模块的前缀常量；此外也接受栏位行自带的自定义 `label`
+    （用户改过栏位名时不算“没有栏位”）。只读文本，不看任何图片（N-11）。
+    """
+    titles: List[str] = []
+    try:
+        from . import docgen  # 局部导入：复用“栏位标题行”这一文本约定的唯一来源
+
+        titles.append(docgen.photo_slot_title(key))
+    except Exception:  # pragma: no cover - docgen 不可用时退回常量
+        label = constants.PHOTO_POSITION_LABELS.get(key, key)
+        if getattr(constants.PHOTO_POSITION_INDEX.get(key), "wide", False):
+            label = f"{label}（宽幅）"
+        titles.append(_PHOTO_SLOT_TITLE_PREFIX + label)
+    label = _photo_slot_label(key, photos)
+    if label:
+        titles.append(_PHOTO_SLOT_TITLE_PREFIX + label)
+    return titles
+
+
+def _rendered_texts(case_data: Any, stored_text: str, rendered_snapshot: str) -> List[str]:
+    """所有可用的“文稿正文文本”：逐文稿文本 + `stored_text` + 生成时快照。
+
+    用于判断某个照片栏位是否**真的**出现在文稿里（`PHOTO_SLOT_MISSING`）。
+    宁缺勿猜：一条文本都没有时返回空列表，调用方据此按“没有栏位”报告。
+    """
+    texts: List[str] = []
+    for document in _rows(case_data, "documents"):
+        value = _text(document.get("rendered_text")) or _text(document.get("text"))
+        if value.strip():
+            texts.append(value)
+    for value in (stored_text, rendered_snapshot):
+        text = _text(value)
+        if text.strip():
+            texts.append(text)
+    return texts
 
 
 # --------------------------------------------------------------------------
@@ -1138,13 +1188,20 @@ def check_format(
     stored_text: str = "",
     rendered_snapshot: str = "",
 ) -> List[CheckItem]:
-    """格式质量检查：占位符残留、草稿标记、PDF 缺失、文本分歧。
+    """格式质量检查：占位符残留、草稿标记、PDF 缺失、文本分歧、照片栏位去向。
 
     ``template_text``：模板正文文本，仅用于判断“模板声明了哪些栏位”（照片栏位占位提示）；
     ``stored_text``：**当前**已渲染文稿的正文文本；
     ``rendered_snapshot``：**生成该文稿时**保存的正文文本快照（``<docx>.render.txt``）。
     ``DOCUMENT_TEXT_DIVERGED`` 只在同时提供快照与当前文本时比较——即检测文稿在生成之后
     被系统之外改动的情形；没有快照时**不报**（宁缺勿猜，避免把“模板≠产物”误报成缺陷）。
+
+    照片栏位（**设计选择，语义冻结在此**）：`render_document` 把“模板没有声明任何
+    ``{{ photo_* }}`` 锚点、但案件确有已指派位置的照片”做成**默认兜底**——自动向渲染用的
+    **工作副本**追加标准「部位照片」区（18 个栏位，模板原件不改动，N-8），因此**自动追加
+    成功后不再产出** ``PHOTO_SLOT_MISSING``；本 code 只在“照片确实无处安放”时产出：模板
+    没声明该栏位、且渲染产物正文里也没有该栏位的标题行（生成失败 / 追加异常 / 模板与输出
+    同一路径 / 模板只声明了别的栏位）。判定只看文本，不打开任何图片（N-11）。
     """
     items: List[CheckItem] = []
     documents = _rows(case_data, "documents")
@@ -1417,6 +1474,72 @@ def check_format(
                 suggestion=(
                     "如本案确有该部位照片，请上传并指派到该栏位；确实没有照片时保留占位文字，"
                     "并在清单中注明“本次未提供该部位照片”。"
+                ),
+            )
+        )
+
+    # ---- PHOTO_SLOT_MISSING -----------------------------------------------
+    # 与 `PHOTO_SLOT_EMPTY` 的分界（两者绝不可混用）：
+    #   * `PHOTO_SLOT_EMPTY`（info）：**模板声明了**该栏位，本次没有照片 → 正文写占位文字；
+    #   * `PHOTO_SLOT_MISSING`（warning）：**案件里有已指派位置的照片，但文稿里根本没有
+    #     这个栏位**（模板没声明该栏位的 `{{ photo_<key> }}` 锚点，渲染产物里也找不到
+    #     该栏位的标题行）→ 照片进不了文稿。
+    # 系统默认会在渲染时向**工作副本**追加标准「部位照片」区（`docgen.append_photo_section`，
+    # 模板原件不改动，N-8），此时栏位标题行会出现在文稿正文里，本 code **不再产出**；
+    # 只有当追加没有发生（生成失败、追加异常、模板与输出同一路径）或模板只声明了**别的**
+    # 栏位时才会命中——也就是照片确实无处安放的情形。
+    layout_texts = _rendered_texts(case_data, stored_text, rendered_snapshot)
+    declared_keys = _declared_photo_keys(case_data, template_text)
+    for key in constants.PHOTO_POSITION_KEYS:
+        if key in declared_keys:
+            continue
+        photos = [
+            photo
+            for photo in (slot_photos.get(key) or [])
+            if _file_state(case_data, photo.get("path")) is not False
+        ]
+        if not photos:
+            continue
+        titles = _photo_slot_title_texts(key, photos)
+        if any(title in text for title in titles for text in layout_texts):
+            # 该栏位确实出现在文稿正文里（例如系统自动追加标准照片区后渲染）→ 不报。
+            continue
+        label = _photo_slot_label(key, photos)
+        material_ids = sorted({photo["material_id"] for photo in photos if photo.get("material_id")})
+        filenames = [photo["filename"] for photo in photos if photo.get("filename")]
+        items.append(
+            CheckItem(
+                category="format",
+                severity="warning",
+                code="PHOTO_SLOT_MISSING",
+                title="文稿里没有该照片栏位，照片无法插入",
+                detail=(
+                    f"本案有 {len(photos)} 张已指派到“{label}”（{key}）的照片"
+                    + (f"（材料 {', '.join(str(value) for value in material_ids)}）"
+                       if material_ids else "")
+                    + (f"（{('、'.join(filenames))[:60]}）" if filenames else "")
+                    + "，但模板没有声明任何照片栏位锚点、渲染产物里也没有该栏位："
+                    "这些照片不会被插入文稿，请在模板中加入 "
+                    "{{ photo_" + key + " }} 栏位或让系统自动追加标准「部位照片」区"
+                    "（自动追加只改渲染用的工作副本，模板原件不改动，N-8）。"
+                ),
+                target_type="photo_slot",
+                target_id=_photo_slot_target_id(key),
+                source={
+                    "position_key": key,
+                    "position_label": label,
+                    "photo_count": len(photos),
+                    "material_ids": material_ids,
+                    "filenames": filenames,
+                    "declared_slot_keys": list(declared_keys),
+                    "anchor": constants.PHOTO_POSITION_ANCHORS.get(key, f"photo_{key}"),
+                    "checked_texts": len(layout_texts),
+                    "reason": "no_photo_anchor_in_template_and_no_slot_in_document",
+                },
+                suggestion=(
+                    "在模板里加入 {{ photo_" + key + " }} 独立段落锚点"
+                    "（或任意 {{ photo_* }} 锚点，让系统按标准 18 个栏位自动追加照片区），"
+                    "然后重新生成文稿；不要手工改动已生成的文稿。"
                 ),
             )
         )

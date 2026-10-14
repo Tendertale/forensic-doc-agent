@@ -159,9 +159,16 @@ function sizeText(injury) {
   return `${parts.join(' × ')} ${injury.size_unit || ''}`.trim()
 }
 
+/**
+ * 原页位置（bbox）：`[x0, y0, x1, y1]` 且归一化到 0–1（与 sidecar 输出一致），
+ * 显示到小数点后 3 位，不做四舍五入压缩。
+ */
 function bboxText(bbox) {
   if (!Array.isArray(bbox) || bbox.length < 4) return '未记录'
-  return bbox.map((value) => Number(value).toFixed(1)).join(', ')
+  const values = bbox.slice(0, 4).map((value) => Number(value))
+  if (values.some((value) => !Number.isFinite(value))) return '未记录'
+  const [x0, y0, x1, y1] = values
+  return `左 ${x0.toFixed(3)} · 上 ${y0.toFixed(3)} · 右 ${x1.toFixed(3)} · 下 ${y1.toFixed(3)}（归一化 0–1）`
 }
 
 async function save(injury) {

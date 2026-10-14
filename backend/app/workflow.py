@@ -760,6 +760,9 @@ def run_render(database, storage, case_id: int, *, doc_type: str = "report",
         "pdf_absolute": str(storage.absolute(pdf_relative)) if pdf_relative else "",
         "engine": getattr(result, "engine", ""),
         "unresolved": unresolved,
+        # docgen 的渲染说明（例如「模板未声明照片栏位，已自动追加标准照片区」），
+        # 供 quick-run 的 notes / 前端结果页如实展示；docgen 未提供时为空列表。
+        "notes": [str(item) for item in (getattr(result, "notes", None) or [])],
         "paragraph_count": getattr(result, "paragraph_count", 0),
         "table_count": getattr(result, "table_count", 0),
         "photos_assigned": sum(len(slot.get("photos") or []) for slot in slots),

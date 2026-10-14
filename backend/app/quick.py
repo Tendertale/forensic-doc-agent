@@ -32,6 +32,7 @@ from .constants import (
     DEFAULT_TEMPLATE_VERSION,
     MATERIAL_KIND_LABELS,
     PHOTO_MATERIAL_KIND,
+    PHOTO_POSITION_KEYS,
     PHOTO_POSITION_LABELS,
 )
 from .workflow import (
@@ -547,6 +548,14 @@ def run_quick_pipeline(database, storage, payload) -> Dict[str, Any]:
             "可安装 LibreOffice 后重新导出，或在本机用 Word 另存为 PDF"
         )
 
+    # 生成阶段的说明（`docgen.RenderResult.notes`）：系统做了什么必须可见（R-59～R-63）。
+    # 上游尚未把 notes 放进 payload 时，按模板与产物自行核对，仍然如实说明照片的去向，
+    # 绝不因为“没拿到说明字段”就让照片静默消失。
+    render_notes = _render_notes(render_payload)
+    notes.extend(render_notes)
+    if not render_notes:
+        notes.extend(_photo_placement_notes(database, storage, render_payload, registered))
+
     try:
         result = run_check(database, storage, case_id,
                            document_id=int(document_id) if document_id else None,
@@ -614,6 +623,150 @@ def run_quick_pipeline(database, storage, payload) -> Dict[str, Any]:
 # --------------------------------------------------------------------------
 # 三、内部工具
 # --------------------------------------------------------------------------
+
+
+def _render_notes(render_payload: Mapping[str, Any]) -> List[str]:
+    """透出 `docgen.RenderResult.notes`（渲染过程中的中文说明）。
+
+    对 payload 里的 ``notes`` 做**前向兼容**读取：`workflow.run_render` 目前只放部分
+    字段，一旦上游补上 ``notes`` 就自动生效，本模块不需要再改；为空则返回空列表，
+    由 :func:`_photo_placement_notes` 按产物核对兜底说明。
+    """
+
+    value = render_payload.get("notes") if isinstance(render_payload, Mapping) else None
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: List[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _document_docx_path(storage, render_payload: Mapping[str, Any]):
+    """本次生成文稿的绝对路径（payload 优先，其次按存储根拼接）；没有则返回 None。"""
+
+    absolute = str(render_payload.get("docx_absolute") or "")
+    if absolute:
+        return Path(absolute)
+    relative = str(render_payload.get("docx_path") or "")
+    if relative:
+        try:
+            return Path(storage.absolute(relative))
+        except Exception:  # noqa: BLE001 - 路径解析失败按“没有文稿”处理
+            return None
+    return None
+
+
+def _template_text_used(database, storage, render_payload: Mapping[str, Any]) -> str:
+    """本次生成所用模板的正文文本（只读文件；读不出来返回空串）。
+
+    模板路径取自文稿行的 ``template_path``（`workflow.run_render` 实际使用的那一份）。
+    只读文档文本，不打开、不解码任何图片（N-11）。
+    """
+
+    try:
+        document_id = int(render_payload.get("document_id") or 0)
+    except (TypeError, ValueError):
+        document_id = 0
+    if not document_id:
+        return ""
+    try:
+        document = database.get_document(document_id) or {}
+    except Exception:  # noqa: BLE001 - 读不到文稿行时按“模板文本未知”处理
+        return ""
+    relative = str(document.get("template_path") or "")
+    if not relative:
+        return ""
+    try:
+        path = Path(storage.absolute(relative))
+    except Exception:  # noqa: BLE001
+        return ""
+    if not path.is_file():
+        return ""
+    try:
+        docgen = importlib.import_module(".docgen", __package__)
+        return docgen.extract_document_text(str(path)) or ""
+    except Exception:  # noqa: BLE001 - 模板文本读不出来时不猜栏位
+        return ""
+
+
+def _inline_shape_count(path: Path) -> int:
+    """文稿里的图片个数（只数个数，不解码、不查看像素内容，N-11）；读不出来返回 -1。"""
+
+    try:
+        from docx import Document as _DocxDocument
+
+        return len(_DocxDocument(str(path)).inline_shapes)
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def _photo_placement_notes(database, storage, render_payload: Mapping[str, Any],
+                           registered: Sequence[Mapping[str, Any]]) -> List[str]:
+    """按模板与产物核对“照片到底进没进文稿”，并把结论写进说明（绝不静默）。
+
+    只在**确有已指派位置的照片**时产出说明。判据（全部只看文件与文本，N-11）：
+
+    * 模板自己声明了照片栏位 → 不在这里说明：逐栏位情形由校核清单负责
+      （``PHOTO_FILE_MISSING`` / ``PHOTO_SLOT_EMPTY`` / ``PHOTO_SLOT_MISSING``）；
+    * 模板没有任何 ``{{ photo_* }}`` 锚点 → 生成时由 `docgen.render_document` 向
+      **工作副本**自动追加标准「部位照片」区（18 个栏位，模板原件不改动，N-8）：
+      文稿里确实有图片 → 说明“已自动追加并插入”；文稿里没有图片或文稿根本没生成
+      → 如实写明“照片未插入文稿”，并给出下一步（在模板里加栏位后重新生成）。
+    """
+
+    assigned = [
+        item
+        for item in registered or []
+        if str(item.get("kind") or "") == PHOTO_MATERIAL_KIND
+        and str(item.get("position_key") or "").strip()
+    ]
+    if not assigned:
+        return []
+
+    docgen = None
+    try:
+        docgen = importlib.import_module(".docgen", __package__)
+    except Exception:  # noqa: BLE001 - docgen 不可用时退化为“只按目录栏位数说明”
+        docgen = None
+
+    template_text = _template_text_used(database, storage, render_payload)
+    declared: List[str] = []
+    if docgen is not None:
+        try:
+            declared = list(docgen.template_photo_keys(template_text) or [])
+        except Exception:  # noqa: BLE001
+            declared = []
+    if declared:
+        # 模板声明了照片栏位（含演示模板的 18 个）：栏位级的说明交给校核清单。
+        return []
+
+    docx_path = _document_docx_path(storage, render_payload)
+    if docx_path is None or not docx_path.is_file():
+        return [
+            "本次未生成 Word 文稿：照片未插入文稿（照片不会被静默省略，"
+            "请查看「生成」步骤的说明后重试）"
+        ]
+
+    inserted = _inline_shape_count(docx_path)
+    if inserted < 0:
+        return [
+            "模板未声明照片栏位：无法核对文稿内的图片数量，"
+            "请打开文稿确认照片是否已插入（系统只按位置插入照片，不读取照片内容，N-11）"
+        ]
+    if inserted > 0:
+        return [
+            "模板未声明照片栏位：已按标准「部位照片」区（{0} 个栏位）自动追加照片栏位"
+            "后再生成，模板原件未改动（N-8）；本次文稿内共有图片 {1} 张".format(
+                len(PHOTO_POSITION_KEYS), inserted)
+        ]
+    return [
+        "模板未声明照片栏位且未能追加照片区：照片未插入文稿"
+        "（已指派位置的照片 {0} 张均未进入文稿，请在模板中加入 {{{{ photo_<位置> }}}} "
+        "栏位后重新生成）".format(len(assigned))
+    ]
 
 
 def _register_page_probe(database, storage, material: Mapping[str, Any]) -> int:

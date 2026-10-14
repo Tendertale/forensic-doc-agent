@@ -18,14 +18,19 @@
 | TODO-DL-6 | 真实样本与已审核文稿 | 需求 R-53：用代表性样本建立正确答案并配置模板/术语 | 由业务方提供 | 使用内置演示案件与程序化生成的演示模板；**不承诺识别率或节省时间** | `backend/app/seed.py::seed_demo_case()` |
 | TODO-DL-7 | 真实部位照片样本 | 需求 R-54～R-58：验证照片栏位插入效果 | 由业务方提供 | 演示案件使用**程序化生成的纯色占位图**（不含真实人体内容）；系统只按用户指定的位置插入照片，不识别照片内容（N-11） | `backend/app/seed.py` 的照片占位图 + `frontend/static/` 照片区块 |
 
-> **TODO-DL-3 实测结论（2026-10-12 探针，非文档推断）**：本机 Node v22.23.2 / npm 10.9.8 / pnpm 11 可用，
+> **TODO-DL-3 状态更新（2026-10-14，实测，取代下面的旧结论）**：本机 **`npm install` 与 `npm run build` 实际可用**
+> （网络经本机 HTTP 代理 `127.0.0.1:7897`），`frontend/node_modules` 已装（vue 3.5.44、vite 6.4.4 等 90 个包），
+> `frontend/dist` 已成功构建。此前判定「无法安装」是因为只测了**离线模式**
+> （`pnpm install --offline` → `ERR_PNPM_NO_OFFLINE_META`），并非网络不可用——这一点已更正。
+> 当前形态：**两个前端并存且 UX 必须一致**——`frontend/static/**`（零构建工作台，服务器部署默认走它）
+> 与 `frontend/src/**`（Vue 3 源码，存在 `frontend/dist` 时由 `/` 提供）。
+> 新增护栏用例 `backend/tests/test_guards.py::test_built_frontend_is_not_stale`：若 `dist` 早于源码即失败，
+> 避免「改了源码没重新构建 → 用户看到旧界面」。**浏览器交互本身仍未自动化验证。**
+
+> **旧结论（保留存档，已被上面更正）**：本机 Node v22.23.2 / npm 10.9.8 / pnpm 11 可用，
 > 但 `pnpm install --offline` 失败（`ERR_PNPM_NO_OFFLINE_META`）：pnpm 元数据缓存中没有
 > `vue@3`、`vite`、`@vitejs/plugin-vue`、`tailwindcss@3`、`postcss`、`autoprefixer`、`lucide-vue-next`；
 > npm 缓存中只有 `vue@2.7.16` 与 `vite@8.x`，与 `frontend/package.json` 的依赖不匹配。
-> 因此在“禁止联网下载”的约束下，Vue 3 源码既不能构建、也不能在浏览器中运行。
-> 为此新增 `frontend/static/`：**无构建依赖、纯 ES 模块 + fetch** 的工作台，由 FastAPI 在 `/` 直接提供
-> （见 `docs/architecture.md` 第 7.3 节），四步主流程与全部端点一致，是当前唯一可实际运行的前端。
-> Vue 3 源码仍按契约补全，供将来有网络时执行 `npm install && npm run build`。
 
 
 ## 不受影响、当前即可完整运行的部分
