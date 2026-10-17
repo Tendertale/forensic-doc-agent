@@ -170,7 +170,7 @@ def test_n12_placeholder_text_is_explicit_and_not_a_normal_finding():
 def test_r52_acceptance_notes_are_documented_as_todo_downloads():
     """R-52 / R-53 / TODO-DL-6/7：演示数据明确标注，真实样本与识别率不作承诺。"""
 
-    todo = (PROJECT_ROOT / "docs" / "TODO_DOWNLOADS.md").read_text(encoding="utf-8")
+    todo = (PROJECT_ROOT / "TODO.md").read_text(encoding="utf-8")
     for code in ("TODO-DL-1", "TODO-DL-2", "TODO-DL-3", "TODO-DL-6", "TODO-DL-7"):
         assert code in todo
     assert "不承诺识别率" in todo or "不承诺" in todo
